@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/game-studio/story-v2.schema.json",
+  "title": "StoryV1 (schemaVersion 2.x)",
+  "type": "object",
+  "required": ["startNodeId", "nodes"],
+  "additionalProperties": true,
+  "properties": {
+    "schemaVersion": { "type": "string" },
+    "startNodeId": { "type": "string", "minLength": 1 },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "name", "body"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "kind": { "type": "string", "enum": ["scene", "ending"] },
+          "name": { "type": "string" },
+          "body": {
+            "type": "object",
+            "required": ["text"],
+            "additionalProperties": true,
+            "properties": {
+              "text": { "type": "string" },
+              "title": { "type": "string" }
+            }
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "text", "toNodeId"],
+              "additionalProperties": true,
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "text": { "type": "string" },
+                "toNodeId": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
+          "timeline": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "steps": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["id", "actions", "advance"],
+                  "additionalProperties": true,
+                  "properties": {
+                    "id": { "type": "string" },
+                    "actions": { "type": "array" },
+                    "advance": { "type": "object" }
+                  }
+                }
+              }
+            }
+          },
+          "visuals": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "backgroundAssetId": { "type": "string" },
+              "placements": { "type": "array" },
+              "ui": { "type": "object" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

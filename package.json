@@ -1,0 +1,18 @@
+{
+  "name": "game-studio",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:editor": "npm --workspace @game-studio/editor run dev",
+    "dev:server": "npm --workspace @game-studio/server run dev",
+    "build:editor": "npm --workspace @game-studio/editor run build",
+    "build:packages": "npm --workspace @game-studio/schema run build && npm --workspace @game-studio/builder run build && npm --workspace @game-studio/runtime-pixi run build",
+    "typecheck": "npm --workspace @game-studio/editor run typecheck",
+    "sync:from-compose": "node tools/syncFromCompose.mjs",
+    "lint": "echo \"(todo)\""
+  }
+}

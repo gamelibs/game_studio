@@ -1,0 +1,205 @@
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+
+function nowIso() {
+  try { return new Date().toISOString() } catch (_) { return String(Date.now()) }
+}
+
+function sanitizeProvider(v) {
+  const s = String(v || '').trim().toLowerCase()
+  return s || null
+}
+
+function sanitizeModel(v) {
+  const s = String(v || '').trim()
+  return s || null
+}
+
+function sanitizeUrl(v) {
+  const s = String(v || '').trim()
+  if (!s) return null
+  try {
+    const u = new URL(s)
+    const p = String(u.protocol || '').toLowerCase()
+    if (p !== 'http:' && p !== 'https:' && p !== 'socks:' && p !== 'socks5:' && p !== 'socks5h:' && p !== 'socks4:' && p !== 'socks4a:') return null
+    return u.toString().replace(/\/+$/, '')
+  } catch (_) {
+    return null
+  }
+}
+
+function sanitizeSize(v) {
+  const s = String(v || '').trim()
+  if (!s) return null
+  if (/^\d{2,5}x\d{2,5}$/i.test(s)) return s.toLowerCase()
+  if (/^(?:1k|2k|4k)$/i.test(s)) return s.toUpperCase()
+  return null
+}
+
+function sanitizeBool(v, fallback) {
+  if (typeof v === 'boolean') return v
+  if (v == null) return Boolean(fallback)
+  const s = String(v).trim().toLowerCase()
+  if (s === 'true' || s === '1' || s === 'yes' || s === 'on') return true
+  if (s === 'false' || s === '0' || s === 'no' || s === 'off') return false
+  return Boolean(fallback)
+}
+
+export function studioSettingsFilePath(storageRoot) {
+  const root = String(storageRoot || '').trim()
+  if (!root) throw new Error('missing_storage_root')
+  return path.join(root, '_config', 'studio_settings.json')
+}
+
+const cache = {
+  mtimeMs: 0,
+  value: null
+}
+
+export async function readStudioSettings(storageRoot) {
+  const p = studioSettingsFilePath(storageRoot)
+  try {
+    const st = await stat(p)
+    if (cache.value && cache.mtimeMs && Number(st.mtimeMs) === Number(cache.mtimeMs)) return cache.value
+    const raw = await readFile(p, 'utf-8')
+    const json = JSON.parse(raw)
+    if (!json || typeof json !== 'object') return null
+    cache.mtimeMs = Number(st.mtimeMs) || 0
+    cache.value = json
+    return json
+  } catch (_) {
+    return null
+  }
+}
+
+export async function writeStudioSettings(storageRoot, incoming) {
+  const p = studioSettingsFilePath(storageRoot)
+  const dir = path.dirname(p)
+  await mkdir(dir, { recursive: true })
+
+  const prev = (await readStudioSettings(storageRoot)) || {}
+  const inObj = incoming && typeof incoming === 'object' ? incoming : {}
+
+  const has = (obj, k) => Boolean(obj && typeof obj === 'object' && Object.prototype.hasOwnProperty.call(obj, k))
+  const inEnabled = inObj?.enabled
+  const inScripts = inObj?.scripts
+  const inPrompt = inObj?.prompt
+  const inImage = inObj?.image
+  const inTts = inObj?.tts
+  const inNet = inObj?.network
+
+  const next = {
+    schemaVersion: '1.0',
+    updatedAt: nowIso(),
+    enabled: {
+      scripts: sanitizeBool(has(inEnabled, 'scripts') ? inEnabled.scripts : prev?.enabled?.scripts, prev?.enabled?.scripts ?? true),
+      prompt: sanitizeBool(has(inEnabled, 'prompt') ? inEnabled.prompt : prev?.enabled?.prompt, prev?.enabled?.prompt ?? true),
+      image: sanitizeBool(has(inEnabled, 'image') ? inEnabled.image : prev?.enabled?.image, prev?.enabled?.image ?? true),
+      tts: sanitizeBool(has(inEnabled, 'tts') ? inEnabled.tts : prev?.enabled?.tts, prev?.enabled?.tts ?? false)
+    },
+    scripts: {
+      provider: has(inScripts, 'provider') ? sanitizeProvider(inScripts.provider) : sanitizeProvider(prev?.scripts?.provider),
+      model: has(inScripts, 'model') ? sanitizeModel(inScripts.model) : sanitizeModel(prev?.scripts?.model)
+    },
+    prompt: {
+      provider: has(inPrompt, 'provider') ? sanitizeProvider(inPrompt.provider) : sanitizeProvider(prev?.prompt?.provider),
+      model: has(inPrompt, 'model') ? sanitizeModel(inPrompt.model) : sanitizeModel(prev?.prompt?.model)
+    },
+    image: {
+      provider: has(inImage, 'provider') ? sanitizeProvider(inImage.provider) : sanitizeProvider(prev?.image?.provider),
+      model: has(inImage, 'model') ? sanitizeModel(inImage.model) : sanitizeModel(prev?.image?.model),
+      apiUrl: has(inImage, 'apiUrl') ? sanitizeUrl(inImage.apiUrl) : sanitizeUrl(prev?.image?.apiUrl),
+      size: has(inImage, 'size') ? sanitizeSize(inImage.size) : sanitizeSize(prev?.image?.size),
+      sdwebuiBaseUrl: has(inImage, 'sdwebuiBaseUrl') ? sanitizeUrl(inImage.sdwebuiBaseUrl) : sanitizeUrl(prev?.image?.sdwebuiBaseUrl)
+    },
+    tts: {
+      provider: has(inTts, 'provider') ? sanitizeProvider(inTts.provider) : sanitizeProvider(prev?.tts?.provider),
+      model: has(inTts, 'model') ? sanitizeModel(inTts.model) : sanitizeModel(prev?.tts?.model),
+      apiUrl: has(inTts, 'apiUrl') ? sanitizeUrl(inTts.apiUrl) : sanitizeUrl(prev?.tts?.apiUrl)
+    },
+    network: {
+      proxyUrl: has(inNet, 'proxyUrl') ? sanitizeUrl(inNet.proxyUrl) : sanitizeUrl(prev?.network?.proxyUrl)
+    }
+  }
+
+  await writeFile(p, JSON.stringify(next, null, 2), 'utf-8')
+  try {
+    const st = await stat(p)
+    cache.mtimeMs = Number(st.mtimeMs) || 0
+    cache.value = next
+  } catch (_) {
+    cache.mtimeMs = 0
+    cache.value = next
+  }
+  return next
+}
+
+function envFirst(...keys) {
+  for (const k of keys) {
+    const v = String(process.env[k] || '').trim()
+    if (v) return v
+  }
+  return ''
+}
+
+export async function getEffectiveStudioConfig(storageRoot) {
+  const settings = (await readStudioSettings(storageRoot)) || null
+  const DEFAULT_DOUBAO_TEXT_MODEL = 'doubao-1-5-pro-32k-250115'
+
+  const env = {
+    aiProvider: String(process.env.STUDIO_AI_PROVIDER || 'local').toLowerCase(),
+    aiModel: String(process.env.STUDIO_AI_MODEL || '').trim(),
+    bgProvider: String(process.env.STUDIO_BG_PROVIDER || 'sdwebui').toLowerCase(),
+    sdwebuiBaseUrl: String(process.env.SDWEBUI_BASE_URL || 'http://127.0.0.1:7860').trim(),
+    doubaoImagesUrl: envFirst('DOUBAO_ARK_IMAGES_URL', 'DOUBAO_ARK_API_URL'),
+    doubaoImagesModel: String(process.env.DOUBAO_ARK_MODEL || '').trim(),
+    doubaoTextModel: String(envFirst('DOUBAO_ARK_TEXT_MODEL', 'DOUBAO_ARK_LLM_MODEL', 'DOUBAO_LLM_MODEL') || '').trim(),
+    doubaoImageSize: String(process.env.DOUBAO_IMAGE_SIZE || '').trim(),
+    proxyUrl: envFirst('STUDIO_PROXY_URL', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY')
+  }
+
+  const enabled = {
+    scripts: settings?.enabled?.scripts !== false,
+    prompt: settings?.enabled?.prompt !== false,
+    image: settings?.enabled?.image !== false,
+    tts: settings?.enabled?.tts === true
+  }
+
+  const scriptsProvider = (settings?.scripts?.provider ? String(settings.scripts.provider) : env.aiProvider) || 'local'
+  const scriptsModel = settings?.scripts?.model
+    ? String(settings.scripts.model)
+    : scriptsProvider === 'openai'
+      ? env.aiModel
+      : (env.doubaoTextModel || DEFAULT_DOUBAO_TEXT_MODEL)
+
+  const promptProvider =
+    (settings?.prompt?.provider ? String(settings.prompt.provider) : (env.bgProvider === 'doubao' ? 'doubao' : env.aiProvider)) || 'openai'
+  const promptModel = settings?.prompt?.model
+    ? String(settings.prompt.model)
+    : promptProvider === 'openai'
+      ? env.aiModel
+      : (env.doubaoTextModel || DEFAULT_DOUBAO_TEXT_MODEL)
+
+  const imageProvider = (settings?.image?.provider ? String(settings.image.provider) : env.bgProvider) || 'sdwebui'
+  const imageModel = settings?.image?.model ? String(settings.image.model) : env.doubaoImagesModel
+  const imageApiUrl = settings?.image?.apiUrl ? String(settings.image.apiUrl) : env.doubaoImagesUrl
+  const imageSize = settings?.image?.size ? String(settings.image.size) : env.doubaoImageSize
+  const sdwebuiBaseUrl = settings?.image?.sdwebuiBaseUrl ? String(settings.image.sdwebuiBaseUrl) : env.sdwebuiBaseUrl
+
+  const proxyUrl = settings?.network?.proxyUrl ? String(settings.network.proxyUrl) : env.proxyUrl
+
+  const effective = {
+    enabled,
+    scripts: { provider: scriptsProvider, model: scriptsModel || null },
+    prompt: { provider: promptProvider, model: promptModel || null },
+    image: { provider: imageProvider, model: imageModel || null, apiUrl: imageApiUrl || null, size: imageSize || null, sdwebuiBaseUrl: sdwebuiBaseUrl || null },
+    tts: {
+      provider: settings?.tts?.provider ? String(settings.tts.provider) : 'none',
+      model: settings?.tts?.model ? String(settings.tts.model) : null,
+      apiUrl: settings?.tts?.apiUrl ? String(settings.tts.apiUrl) : null
+    },
+    network: { proxyUrl: proxyUrl || null }
+  }
+
+  return { settings, effective, env }
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.vite/
+.DS_Store
+storage/demos/
+storage/projects/
+storage/demo_library/
+.env
+.env.local
+.env.*.local

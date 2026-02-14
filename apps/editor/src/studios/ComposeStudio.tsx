@@ -1,0 +1,5323 @@
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { Application, Container, Sprite, Texture } from 'pixi.js'
+import AiBackgroundModal from '../AiBackgroundModal'
+import AiCharacterSpriteModal, { type AiCharacterSpriteDraft } from '../AiCharacterSpriteModal'
+import { chromaKeyUrlToPng } from '../chromaKey'
+import {
+  analyzeBackgroundPromptAi,
+  analyzeCharacterFingerprintAi,
+  createProject,
+  exportProject,
+  generateBackgroundAi,
+  generateCharacterSpriteAi,
+  getBlueprint,
+  getScripts,
+	  getProject,
+	  listProjects,
+	  resolveUrl,
+	  saveProject,
+	  uploadProjectImage,
+  type AiBackgroundRequest,
+  type AssetV1,
+  type CharacterPlacementV1,
+  type CharacterV1,
+  type ChoiceV1,
+	  type ConditionExprV1,
+	  type EndingCardV1,
+	  type DialogLayoutV1,
+	  type DialogPresetV1,
+	  type ChoicesLayoutV1,
+	  type ChoicesDirectionV1,
+	  type ChoicesAlignV1,
+  type NodeV1,
+  type NodeUiV1,
+  type ProjectV1,
+  type ProjectEventV1,
+  type StageConfigV1,
+  type StateVarDefV1,
+  type TimelineActionV1,
+  type TimelineAdvanceV1,
+  type ScriptDocV1,
+  type StoryV1
+} from '../api'
+
+type Selection =
+  | { type: 'none' }
+  | { type: 'node'; id: string }
+  | { type: 'character'; id: string }
+  | { type: 'asset'; id: string }
+
+type LeftTab = 'nodes' | 'characters' | 'assets'
+
+	type EditorDoc = {
+	  mode: 'project' | 'none'
+	  readonly: boolean
+	  id: string
+	  title: string
+	  assetBase: string
+	  project: ProjectV1 | null
+  story: StoryV1 | null
+}
+
+function uid(prefix = 'id') {
+  return `${prefix}_${Math.random().toString(36).slice(2, 10)}`
+}
+
+function nodeKindLabel(kind: NodeV1['kind']) {
+  return kind === 'ending' ? '结局' : '场景'
+}
+
+function scriptCardLabel(sc: any) {
+  const order = Number(sc && sc.order) || 0
+  const name = String(sc && sc.name || '').trim()
+  if (order && name) return `#${order} ${name}`
+  if (name) return name
+  if (order) return `#${order}`
+  return ''
+}
+
+function clamp01(n: number) {
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.min(1, n))
+}
+
+type StageViewport = {
+  stageW: number
+  stageH: number
+  scale: number
+  offsetX: number
+  offsetY: number
+  scaleMode: 'contain' | 'cover'
+}
+
+function computeStageViewport(stageCfg: StageConfigV1 | undefined, viewW: number, viewH: number): StageViewport {
+  const s = normalizeStageV1(stageCfg)
+  const stageW = Math.max(1, Math.floor(numberOr(s.width, 720)))
+  const stageH = Math.max(1, Math.floor(numberOr(s.height, 1280)))
+  const scaleMode = String(s.scaleMode || 'contain') === 'cover' ? 'cover' : 'contain'
+  const sx = viewW / stageW
+  const sy = viewH / stageH
+  const scale = scaleMode === 'cover' ? Math.max(sx, sy) : Math.min(sx, sy)
+  const offsetX = (viewW - stageW * scale) / 2
+  const offsetY = (viewH - stageH * scale) / 2
+  return { stageW, stageH, scale, offsetX, offsetY, scaleMode }
+}
+
+function numberOr(v: unknown, fallback: number) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function resolveAsset(uri: string, assetBase: string) {
+  const s = String(uri || '').trim()
+  if (!s) return ''
+  if (/^https?:\/\//i.test(s)) return s
+  if (/^\//.test(s) && /^https?:\/\//i.test(assetBase || '')) {
+    try {
+      const origin = new URL(assetBase).origin
+      return `${origin}${s}`
+    } catch {}
+  }
+  if (!assetBase) return s
+  return assetBase.replace(/\/+$/, '/') + s.replace(/^\/+/, '')
+}
+
+const textureCache = new Map<string, Promise<Texture> | Texture>()
+
+async function loadTexture(url: string): Promise<Texture | null> {
+  const key = String(url || '').trim()
+  if (!key) return null
+
+  const cached = textureCache.get(key)
+  if (cached) {
+    try {
+      return cached instanceof Promise ? await cached : cached
+    } catch {
+      textureCache.delete(key)
+    }
+  }
+
+  const p = new Promise<Texture>((resolve, reject) => {
+    try {
+      const img = new Image()
+      img.crossOrigin = 'anonymous'
+      img.onload = () => {
+        try {
+          resolve(Texture.from(img))
+        } catch (e) {
+          reject(e)
+        }
+      }
+      img.onerror = () => reject(new Error(`图片加载失败: ${key}`))
+      img.src = key
+    } catch (e) {
+      reject(e)
+    }
+  })
+
+  textureCache.set(key, p)
+
+  try {
+    const tex = await p
+    textureCache.set(key, tex)
+    return tex
+  } catch (e) {
+    textureCache.delete(key)
+    try {
+      console.warn('[game_studio] loadTexture failed:', key, e instanceof Error ? e.message : String(e))
+    } catch {}
+    return null
+  }
+}
+
+type RuntimeWait =
+  | { kind: 'auto' }
+  | { kind: 'click' }
+  | { kind: 'choice' }
+  | { kind: 'timer'; ms: number }
+  | { kind: 'event'; name: string }
+  | { kind: 'condition'; expr: ConditionExprV1; pollMs: number }
+  | { kind: 'end' }
+
+type RuntimeNav =
+  | { type: 'gotoNode'; nodeId: string; delayMs?: number }
+  | { type: 'restart' }
+  | { type: 'backToHub'; url?: string }
+  | null
+
+type RuntimeState = {
+  stepIndex: number
+  text: string
+  toast: string
+  endingCard: EndingCardV1 | null
+  wait: RuntimeWait
+  vars: Record<string, any>
+  eventMemory: Record<string, any>
+  stageOverride: StageOverride
+  nav: RuntimeNav
+}
+
+function buildDefaultVars(vars: StateVarDefV1[] | undefined): Record<string, any> {
+  const out: Record<string, any> = {}
+  const list = Array.isArray(vars) ? vars : []
+  for (const v of list) {
+    const name = String(v && (v as any).name || '').trim()
+    if (!name) continue
+    const type = String(v && (v as any).type || 'string') as any
+    let d = (v as any).default
+    if (type === 'tags') {
+      if (!Array.isArray(d)) d = []
+      d = d.map((x: any) => String(x)).filter(Boolean)
+    } else if (type === 'number') {
+      const n = Number(d)
+      d = Number.isFinite(n) ? n : 0
+    } else if (type === 'boolean') {
+      d = Boolean(d)
+    } else if (type === 'string') {
+      d = String(d ?? '')
+    }
+    out[name] = d
+  }
+  return out
+}
+
+function evalConditionValue(val: any, vars: Record<string, any>) {
+  try {
+    if (val && typeof val === 'object' && typeof val.var === 'string') return vars[String(val.var)]
+  } catch {}
+  return val
+}
+
+function cmp(a: any, b: any) {
+  const na = Number(a)
+  const nb = Number(b)
+  if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb
+  const sa = String(a)
+  const sb = String(b)
+  if (sa === sb) return 0
+  return sa < sb ? -1 : 1
+}
+
+function evalConditionExpr(expr: ConditionExprV1 | null | undefined, vars: Record<string, any>): boolean {
+  if (expr == null) return true
+  if (typeof expr !== 'object') return Boolean(expr)
+  const op = String((expr as any).op || '')
+  if (!op) return Boolean(expr)
+
+  if (op === 'and' || op === 'or') {
+    const args = Array.isArray((expr as any).args) ? (expr as any).args : []
+    if (!args.length) return true
+    return op === 'and'
+      ? args.every((x: any) => evalConditionExpr(x, vars))
+      : args.some((x: any) => evalConditionExpr(x, vars))
+  }
+  if (op === 'not') return !evalConditionExpr((expr as any).arg, vars)
+
+  if (op === 'tags.has') {
+    const v = String((expr as any).var || '').trim()
+    const value = String((expr as any).value || '').trim()
+    const list = Array.isArray(vars[v]) ? vars[v] : []
+    return list.map(String).includes(value)
+  }
+
+  if (op === '==' || op === '!=' || op === '<' || op === '<=' || op === '>' || op === '>=') {
+    const left = evalConditionValue((expr as any).left, vars)
+    const right = evalConditionValue((expr as any).right, vars)
+    const c = cmp(left, right)
+    if (op === '==') return c === 0
+    if (op === '!=') return c !== 0
+    if (op === '<') return c < 0
+    if (op === '<=') return c <= 0
+    if (op === '>') return c > 0
+    if (op === '>=') return c >= 0
+  }
+
+  return Boolean(expr)
+}
+
+function normalizeAdvance(a: TimelineAdvanceV1 | any): TimelineAdvanceV1 {
+  if (!a) return { type: 'auto' }
+  if (typeof a === 'string') {
+    const t = String(a)
+    const allowed: Record<string, true> = {
+      auto: true,
+      click: true,
+      choice: true,
+      timer: true,
+      event: true,
+      condition: true,
+      end: true
+    }
+    return { type: (allowed[t] ? (t as any) : 'auto') as any }
+  }
+  if (typeof a === 'object' && a.type) return a
+  return { type: 'auto' }
+}
+
+function defaultEndingCardForNode(node: NodeV1): EndingCardV1 {
+  return {
+    title: String(node.name || '结局'),
+    bullets: [],
+    moral: String(node.body?.text || '故事结束。'),
+    buttons: [
+      { type: 'restart', label: '重新开始' },
+      { type: 'backToHub', label: '返回工作台' }
+    ]
+  }
+}
+
+type StageOverride = {
+  backgroundAssetId?: string
+  placements?: CharacterPlacementV1[]
+}
+
+async function renderStage(args: {
+  app: Application
+  doc: EditorDoc
+  node: NodeV1 | null
+  stageOverride?: StageOverride | null
+  isStale?: () => boolean
+}) {
+  const { app, doc, node, stageOverride, isStale } = args
+
+  if (isStale && isStale()) return
+
+  app.stage.removeChildren()
+  if (!node || !doc.project || !doc.story) return
+
+  const viewW = app.renderer.width
+  const viewH = app.renderer.height
+  if (!viewW || !viewH) return
+
+  const stageCfg = (doc.project && (doc.project as any).stage) as StageConfigV1 | undefined
+  const vp = computeStageViewport(stageCfg, viewW, viewH)
+
+  const root = new Container()
+  root.x = vp.offsetX
+  root.y = vp.offsetY
+  root.scale.set(vp.scale)
+  app.stage.addChild(root)
+
+  // background
+  try {
+    const bgId = stageOverride?.backgroundAssetId ?? node.visuals?.backgroundAssetId
+    if (bgId) {
+      const a = (doc.project.assets || []).find((x) => x.id === bgId)
+      if (a?.uri) {
+        const url = resolveAsset(a.uri, doc.assetBase)
+        const tex = await loadTexture(url)
+        if (isStale && isStale()) return
+        if (!tex) {
+          try {
+            console.warn('[game_studio] background texture missing:', url)
+          } catch {}
+        } else {
+          const s = new Sprite(tex)
+          s.x = 0
+          s.y = 0
+          s.width = vp.stageW
+          s.height = vp.stageH
+          root.addChild(s)
+        }
+      }
+    }
+  } catch {}
+
+  // placements
+  try {
+    const placements = Array.isArray(stageOverride?.placements)
+      ? stageOverride?.placements
+      : Array.isArray(node.visuals?.placements)
+        ? node.visuals?.placements
+        : []
+    const ordered = placements.slice().sort((a, b) => numberOr(a.zIndex, 0) - numberOr(b.zIndex, 0))
+    for (const p of ordered) {
+      if (p.visible === false) continue
+      const ch = (doc.project.characters || []).find((c) => c.id === p.characterId)
+      const imageAssetId = String(p.imageAssetId || ch?.imageAssetId || '').trim()
+      if (!imageAssetId) continue
+      const a = (doc.project.assets || []).find((x) => x.id === imageAssetId)
+      if (!a?.uri) continue
+
+      const url = resolveAsset(a.uri, doc.assetBase)
+      const tex = await loadTexture(url)
+      if (isStale && isStale()) return
+      if (!tex) continue
+      const sp = new Sprite(tex)
+      sp.anchor.set(0.5, 1)
+
+      const x = clamp01(numberOr(p.transform?.x, 0.5))
+      const y = clamp01(numberOr(p.transform?.y, 1))
+      const scale = numberOr(p.transform?.scale, 1)
+      const rot = numberOr(p.transform?.rotationDeg, 0)
+
+      sp.x = vp.stageW * x
+      sp.y = vp.stageH * y
+      sp.scale.set(scale)
+      sp.rotation = (rot * Math.PI) / 180
+
+      root.addChild(sp)
+    }
+  } catch {}
+}
+
+function normalizeDialogPreset(v: any): DialogPresetV1 {
+  const s = String(v || '').trim()
+  const allowed: Record<string, true> = { bottom: true, top: true, left: true, right: true, center: true, custom: true }
+  return (allowed[s] ? s : 'bottom') as DialogPresetV1
+}
+
+function normalizeChoicesDirection(v: any): ChoicesDirectionV1 {
+  const s = String(v || '').trim()
+  return (s === 'column' ? 'column' : 'row') as ChoicesDirectionV1
+}
+
+function normalizeChoicesAlign(v: any): ChoicesAlignV1 {
+  const s = String(v || '').trim()
+  const allowed: Record<string, true> = { start: true, center: true, end: true, stretch: true }
+  return (allowed[s] ? s : 'end') as ChoicesAlignV1
+}
+
+function normalizeStageV1(raw: any): StageConfigV1 {
+  const s = raw && typeof raw === 'object' ? raw : {}
+  let width = Math.max(1, Math.floor(numberOr((s as any).width, 720)))
+  let height = Math.max(1, Math.floor(numberOr((s as any).height, 1280)))
+
+  const orientationIn = String((s as any).orientation || '').trim()
+  const orientation =
+    orientationIn === 'portrait' || orientationIn === 'landscape'
+      ? (orientationIn as any)
+      : width >= height
+        ? 'landscape'
+        : 'portrait'
+
+  // keep ratio consistent with orientation if user provided mismatched values
+  if (orientation === 'portrait' && width > height) {
+    const t = width
+    width = height
+    height = t
+  }
+  if (orientation === 'landscape' && height > width) {
+    const t = width
+    width = height
+    height = t
+  }
+
+  const scaleMode = String((s as any).scaleMode || 'contain') === 'cover' ? 'cover' : 'contain'
+
+  // clamp to reasonable bounds (P0)
+  width = Math.max(320, Math.min(4096, width))
+  height = Math.max(320, Math.min(4096, height))
+
+  return { width, height, orientation, scaleMode }
+}
+
+function normalizeProjectV1(raw: any): ProjectV1 {
+  const p = (raw || {}) as any
+  const characters = Array.isArray(p.characters) ? p.characters : []
+  const assets = Array.isArray(p.assets) ? p.assets : []
+  const events = Array.isArray(p.events) ? p.events : []
+  const state = p && typeof p.state === 'object' && p.state ? p.state : { vars: [] }
+  if (!Array.isArray(state.vars)) state.vars = []
+  const stage = normalizeStageV1(p.stage)
+  return {
+    schemaVersion: String(p.schemaVersion || '1.0'),
+    id: String(p.id || ''),
+    title: String(p.title || ''),
+    pluginId: String(p.pluginId || 'story-pixi'),
+    pluginVersion: String(p.pluginVersion || '0.1.0'),
+    createdAt: String(p.createdAt || ''),
+    updatedAt: String(p.updatedAt || ''),
+    characters,
+    assets,
+    events,
+    state,
+    stage
+  }
+}
+
+function ensureTimelineForNode(n: NodeV1): NodeV1 {
+  const nn = (n || {}) as any
+  const kind = String(nn.kind || 'scene') === 'ending' ? 'ending' : 'scene'
+  const bodyText = String(nn.body?.text || '')
+  const bodyTitleRaw = nn.body?.title
+  const bodyTitle = typeof bodyTitleRaw === 'string' ? bodyTitleRaw : bodyTitleRaw == null ? '' : String(bodyTitleRaw)
+  const body: any = { text: bodyText }
+  if (String(bodyTitle || '').trim()) body.title = bodyTitle
+  const choices = kind === 'scene' ? (Array.isArray(nn.choices) ? nn.choices : []) : []
+
+  const stepsIn = Array.isArray(nn.timeline?.steps) ? nn.timeline.steps : []
+  if (stepsIn.length) {
+    const steps = stepsIn.map((s: any, i: number) => ({
+      id: String(s && s.id || `st_${nn.id}_${i + 1}`),
+      actions: Array.isArray(s && s.actions) ? s.actions : [],
+      advance: (s && typeof s.advance === 'object' && s.advance) ? s.advance : { type: 'auto' }
+    }))
+    return { ...n, kind: kind as any, body, timeline: { steps } }
+  }
+
+  // Legacy node → minimal timeline
+  if (kind === 'ending') {
+    return {
+      ...n,
+      kind: 'ending',
+      body,
+      timeline: {
+        steps: [
+          {
+            id: `st_${String(nn.id || 'end')}_1`,
+            actions: [
+              {
+                type: 'ui.showEndingCard',
+                card: {
+                  title: String(nn.name || '结局'),
+                  bullets: [],
+                  moral: bodyText || '故事结束。',
+                  buttons: [
+                    { type: 'restart', label: '重新开始' },
+                    { type: 'backToHub', label: '返回工作台' }
+                  ]
+                }
+              }
+            ],
+            advance: { type: 'end' }
+          }
+        ]
+      }
+    }
+  }
+
+  return {
+    ...n,
+    kind: 'scene',
+    body,
+    timeline: {
+      steps: [
+        {
+          id: `st_${String(nn.id || 'scene')}_1`,
+          actions: [{ type: 'ui.setText', mode: 'replace', text: bodyText }],
+          advance: { type: choices.length ? 'choice' : 'click' }
+        }
+      ]
+    }
+  }
+}
+
+function normalizeStoryV1(raw: any): StoryV1 {
+  const s = (raw || {}) as any
+  const nodesIn = Array.isArray(s.nodes) ? s.nodes : []
+  const nodes = nodesIn.map((n: any) => ensureTimelineForNode(n))
+  const startNodeId = String(s.startNodeId || (nodes[0] && nodes[0].id) || '')
+  return { schemaVersion: String(s.schemaVersion || '1.0'), startNodeId, nodes }
+}
+
+  function validate(doc: EditorDoc): string[] {
+    const problems: string[] = []
+    if (!doc.story || !doc.project) return ['未打开项目']
+
+    const project = normalizeProjectV1(doc.project as any)
+    const story = normalizeStoryV1(doc.story as any)
+
+    const nodes = Array.isArray(story.nodes) ? story.nodes : []
+    const nodeIds = new Set(nodes.map((n: any) => String(n && n.id)))
+    const eventIds = new Set((project.events || []).map((e: any) => String(e && e.id)))
+    const stateVarNames = new Set((project.state?.vars || []).map((v: any) => String(v && v.name)))
+
+    if (!story.startNodeId || !nodeIds.has(String(story.startNodeId))) problems.push('startNodeId 无效')
+
+    // state vars: basic validation
+    try {
+      const names = (project.state?.vars || []).map((v: any) => String(v && v.name || '').trim()).filter(Boolean)
+      const dup = names.find((n, idx) => names.indexOf(n) !== idx)
+      if (dup) problems.push(`State 变量名重复：${dup}`)
+    } catch {}
+
+    // event macros: basic validation
+    try {
+      const ids = (project.events || []).map((e: any) => String(e && e.id || '').trim()).filter(Boolean)
+      const dup = ids.find((n, idx) => ids.indexOf(n) !== idx)
+      if (dup) problems.push(`Event 宏 id 重复：${dup}`)
+    } catch {}
+
+    for (const n of nodes) {
+      const nodeId = String((n as any).id || '')
+      const kind = String((n as any).kind || '')
+      const name = String((n as any).name || '').trim()
+      if (!name) problems.push(`节点 ${nodeId} 缺少名称`)
+
+      const timelineSteps = Array.isArray((n as any).timeline?.steps) ? (n as any).timeline.steps : []
+      if (!timelineSteps.length) problems.push(`节点 ${nodeId} 缺少 timeline.steps`)
+
+      for (const [si, st] of timelineSteps.entries()) {
+        const stepId = String(st && st.id || `#${si + 1}`)
+        const adv = normalizeAdvance(st && st.advance)
+        const t = String((adv as any).type || 'auto')
+        if (t === 'choice' && kind === 'scene') {
+          const cs = Array.isArray((n as any).choices) ? (n as any).choices : []
+          if (!cs.length) problems.push(`节点 ${nodeId} 步骤 ${stepId}：choice 但未配置任何选项`)
+        }
+        if (t === 'event') {
+          const name = String((adv as any).name || '').trim()
+          if (!name) problems.push(`节点 ${nodeId} 步骤 ${stepId}：event 缺少 name`)
+        }
+        if (t === 'timer') {
+          const ms = Number((adv as any).ms)
+          if (!Number.isFinite(ms)) problems.push(`节点 ${nodeId} 步骤 ${stepId}：timer.ms 无效`)
+        }
+        if (t === 'condition') {
+          const expr = (adv as any).expr
+          if (!expr) problems.push(`节点 ${nodeId} 步骤 ${stepId}：condition 缺少 expr`)
+        }
+
+        const actions = Array.isArray(st && st.actions) ? st.actions : []
+        for (const a of actions) {
+          const at = String(a && a.type || '')
+          if (at === 'flow.gotoNode') {
+            const to = String(a && (a as any).nodeId || '').trim()
+            if (to && !nodeIds.has(to)) problems.push(`节点 ${nodeId} 动作 flow.gotoNode 指向无效：${to}`)
+          }
+          if (at === 'event.call') {
+            const id = String(a && (a as any).eventId || '').trim()
+            if (id && !eventIds.has(id)) problems.push(`节点 ${nodeId} 动作 event.call 不存在：${id}`)
+          }
+          if (at.startsWith('state.')) {
+            const v = String(a && (a as any).var || '').trim()
+            if (v && !stateVarNames.has(v)) problems.push(`节点 ${nodeId} 动作 ${at} 变量未定义：${v}`)
+          }
+        }
+      }
+
+      if (kind === 'scene') {
+        const choices = Array.isArray((n as any).choices) ? (n as any).choices : []
+        for (const c of choices) {
+          const to = String(c && c.toNodeId || '')
+          const cid = String(c && c.id || '')
+          if (!to || !nodeIds.has(to)) problems.push(`节点 ${nodeId} 选项指向无效：${cid}`)
+        }
+      }
+
+    const placements = Array.isArray((n as any).visuals?.placements) ? (n as any).visuals.placements : []
+    for (const p of placements) {
+      const pid = String(p && p.id || '')
+      const chId = String(p && p.characterId || '')
+      if (chId && !project.characters.find((ch: any) => String(ch && ch.id) === chId)) {
+        problems.push(`节点 ${nodeId} placement 角色不存在：${pid}`)
+      }
+      const img = (p as any).imageAssetId
+      if (img && !project.assets.find((a: any) => String(a && a.id) === String(img))) {
+        problems.push(`节点 ${nodeId} placement ${pid} imageAssetId 不存在：${String(img)}`)
+      }
+    }
+
+    const bg = (n as any).visuals?.backgroundAssetId
+    if (bg && !project.assets.find((a: any) => String(a && a.id) === String(bg))) {
+      problems.push(`节点 ${nodeId} backgroundAssetId 不存在：${String(bg)}`)
+    }
+  }
+
+  for (const ch of project.characters) {
+    const chId = String((ch as any).id || '')
+    const img = (ch as any).imageAssetId
+    if (img && !project.assets.find((a: any) => String(a && a.id) === String(img))) {
+      problems.push(`角色 ${chId} imageAssetId 不存在：${String(img)}`)
+    }
+  }
+
+  return problems
+}
+
+
+export default function ComposeStudio(props: { projectId?: string | null; onBack?: () => void; onBackToHub?: () => void }) {
+  const [projects, setProjects] = useState<ProjectV1[]>([])
+
+  const [doc, setDoc] = useState<EditorDoc>({
+    mode: 'none',
+    readonly: false,
+    id: '',
+    title: '',
+    assetBase: '',
+    project: null,
+    story: null
+  })
+
+  const [selection, setSelection] = useState<Selection>({ type: 'none' })
+  const [leftTab, setLeftTab] = useState<LeftTab>('nodes')
+  const [dirty, setDirty] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [toast, setToast] = useState('')
+  const [runtimeStartNodeId, setRuntimeStartNodeId] = useState<string>('')
+  const [blueprintLoaded, setBlueprintLoaded] = useState(false)
+  const [blueprintNodeIds, setBlueprintNodeIds] = useState<string[]>([])
+  const [scriptsDoc, setScriptsDoc] = useState<ScriptDocV1 | null>(null)
+
+	  const [rightFold, setRightFold] = useState<{
+	    nodeProps: boolean
+	    nodeContent: boolean
+	    timeline: boolean
+	    background: boolean
+	    choices: boolean
+	    placements: boolean
+	  }>({
+	    nodeProps: true,
+	    nodeContent: true,
+	    timeline: true,
+	    background: true,
+	    choices: true,
+	    placements: false
+	  })
+
+  const toggleRightFold = (key: keyof typeof rightFold) =>
+    setRightFold((prev) => ({
+      ...prev,
+      [key]: !prev[key]
+    }))
+
+  const [previewNodeId, setPreviewNodeId] = useState<string>('')
+  const [activePlacementId, setActivePlacementId] = useState<string>('')
+
+  const showProjectManager = !props.onBack && !props.onBackToHub && !props.projectId
+
+  const [rt, setRt] = useState<RuntimeState>({
+    stepIndex: 0,
+    text: '',
+    toast: '',
+    endingCard: null,
+    wait: { kind: 'auto' },
+    vars: {},
+    eventMemory: {},
+    stageOverride: {},
+    nav: null
+  })
+  const rtRef = useRef<RuntimeState>(rt)
+  const rtTimersRef = useRef<{ timeoutId: number | null; pollId: number | null }>({ timeoutId: null, pollId: null })
+
+  const [aiOpen, setAiOpen] = useState(false)
+  const [aiBusy, setAiBusy] = useState(false)
+  const [aiAnalyzing, setAiAnalyzing] = useState(false)
+  const [aiError, setAiError] = useState('')
+  const AI_BG_DRAFT_KEY = `game_studio.ai.backgroundDraft.${String(props.projectId || 'global')}`
+  const loadAiBackgroundDraft = (key: string): Partial<AiBackgroundRequest> | null => {
+    try {
+      const raw = localStorage.getItem(key)
+      if (!raw) return null
+      const json = JSON.parse(raw)
+      if (!json || typeof json !== 'object') return null
+      const v: any = json
+      const out: Partial<AiBackgroundRequest> = {}
+      if (typeof v.userInput === 'string') out.userInput = v.userInput
+      if (typeof v.globalPrompt === 'string') out.globalPrompt = v.globalPrompt
+      if (typeof v.globalNegativePrompt === 'string') out.globalNegativePrompt = v.globalNegativePrompt
+      if (typeof v.backgroundOnly === 'boolean') out.backgroundOnly = v.backgroundOnly
+      if (typeof v.prompt === 'string') out.prompt = v.prompt
+      if (typeof v.negativePrompt === 'string') out.negativePrompt = v.negativePrompt
+      if (typeof v.aspectRatio === 'string') out.aspectRatio = v.aspectRatio as any
+      if (typeof v.style === 'string') out.style = v.style as any
+      if (v.width != null && Number.isFinite(Number(v.width))) out.width = Number(v.width)
+      if (v.height != null && Number.isFinite(Number(v.height))) out.height = Number(v.height)
+      if (v.steps != null && Number.isFinite(Number(v.steps))) out.steps = Number(v.steps)
+      if (v.cfgScale != null && Number.isFinite(Number(v.cfgScale))) out.cfgScale = Number(v.cfgScale)
+      return out
+    } catch {
+      return null
+    }
+  }
+  const saveAiBackgroundDraft = (key: string, draft: AiBackgroundRequest) => {
+    try {
+      localStorage.setItem(
+        key,
+        JSON.stringify({
+          userInput: String(draft.userInput || ''),
+          globalPrompt: String(draft.globalPrompt || ''),
+          globalNegativePrompt: String(draft.globalNegativePrompt || ''),
+          backgroundOnly: Boolean(draft.backgroundOnly),
+          prompt: String(draft.prompt || ''),
+          negativePrompt: String(draft.negativePrompt || ''),
+          aspectRatio: draft.aspectRatio || '9:16',
+          style: draft.style || 'picture_book',
+          width: draft.width ?? 768,
+          height: draft.height ?? 1024,
+          steps: draft.steps ?? 20,
+          cfgScale: draft.cfgScale ?? 7,
+          updatedAt: new Date().toISOString()
+        })
+      )
+    } catch {}
+  }
+
+  const defaultAiReq: AiBackgroundRequest = {
+    userInput: '',
+    globalPrompt: '',
+    globalNegativePrompt: '',
+    backgroundOnly: false,
+    prompt: '',
+    negativePrompt: '',
+    aspectRatio: '9:16',
+    style: 'picture_book',
+    width: 768,
+    height: 1344,
+    steps: 20,
+    cfgScale: 7
+  }
+
+  const [aiReq, setAiReq] = useState<AiBackgroundRequest>(() => {
+    const saved = loadAiBackgroundDraft(AI_BG_DRAFT_KEY)
+    return { ...defaultAiReq, ...(saved || {}) }
+  })
+  const [aiLast, setAiLast] = useState<null | { url?: string; assetPath?: string; provider?: string; remoteUrl?: string }>(null)
+  const bgFileRef = useRef<HTMLInputElement | null>(null)
+  const pendingBgAssetIdRef = useRef<string>('')
+
+  const [chFpBusy, setChFpBusy] = useState(false)
+  const [chFpError, setChFpError] = useState('')
+
+  const defaultChDraft: AiCharacterSpriteDraft = {
+    globalPrompt: '',
+    fingerprintPrompt: '',
+    posePrompt: '',
+    negativePrompt: '',
+    style: 'picture_book',
+    width: 720,
+    height: 1280,
+    steps: 20,
+    cfgScale: 7,
+    keyThreshold: 80,
+    keyFeather: 40,
+    crop: true,
+    padding: 12
+  }
+
+  const [chOpen, setChOpen] = useState(false)
+  const [chBusy, setChBusy] = useState(false)
+  const [chError, setChError] = useState('')
+  const [chDraft, setChDraft] = useState<AiCharacterSpriteDraft>(defaultChDraft)
+  const [chGreen, setChGreen] = useState<null | { url?: string; assetPath?: string; provider?: string; remoteUrl?: string }>(null)
+  const [chTransparentPreviewUrl, setChTransparentPreviewUrl] = useState<string>('')
+  const chTargetRef = useRef<null | { kind: 'character' | 'placement'; characterId: string; nodeId?: string; placementId?: string }>(null)
+
+  useEffect(() => {
+    return () => {
+      const u = String(chTransparentPreviewUrl || '').trim()
+      if (u) {
+        try {
+          URL.revokeObjectURL(u)
+        } catch {}
+      }
+    }
+  }, [chTransparentPreviewUrl])
+
+  useEffect(() => {
+    const saved = loadAiBackgroundDraft(AI_BG_DRAFT_KEY)
+    if (!saved) return
+    setAiReq((prev) => ({ ...defaultAiReq, ...prev, ...saved }))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [AI_BG_DRAFT_KEY])
+
+  useEffect(() => {
+    saveAiBackgroundDraft(AI_BG_DRAFT_KEY, aiReq)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [AI_BG_DRAFT_KEY, aiReq])
+
+  const canvasHostRef = useRef<HTMLDivElement | null>(null)
+  const appRef = useRef<Application | null>(null)
+  const stageRenderSeqRef = useRef(0)
+  const [canvasSize, setCanvasSize] = useState<{ w: number; h: number }>({ w: 0, h: 0 })
+  const stageUiRef = useRef<HTMLDivElement | null>(null)
+  const dragDialogRef = useRef<{
+    dragging: boolean
+    pointerId: number
+    stageW: number
+    stageH: number
+    deltaX: number
+    deltaY: number
+  } | null>(null)
+
+  async function handleUploadBackground(file: File, targetAssetId?: string) {
+    if (!doc.project || !doc.story || doc.readonly) return
+    if (selection.type !== 'node') {
+      setToast('请先选中一个节点再导入背景')
+      return
+    }
+    const node = (doc.story.nodes || []).find((n) => n.id === selection.id) || null
+    const bgId = String(targetAssetId || node?.visuals?.backgroundAssetId || '').trim()
+    if (!bgId) {
+      setToast('请先在「背景资源」选择一个背景资源')
+      return
+    }
+    const bgAsset = (doc.project.assets || []).find((a) => a.id === bgId) || null
+    if (!bgAsset) {
+      setToast('当前节点选择的背景资源不存在（请重新选择背景资源）')
+      return
+    }
+    try {
+      setBusy(true)
+      setError('')
+      const { assetPath, url } = await uploadProjectImage(String(doc.project.id), file)
+      const nextUri = url ? resolveUrl(url) : assetPath
+      setDocProject((p) => {
+        const assets = (p.assets || []).map((a) => (a.id === bgId ? { ...a, uri: nextUri, source: { type: 'upload' as const } } : a))
+        return { ...p, assets }
+      })
+      // set as current node background
+      setDocStory((s) => ({
+        ...s,
+        nodes: (s.nodes || []).map((n) =>
+          n.id === selection.id
+            ? (() => {
+                const nn = ensureNode(n)
+                return { ...nn, visuals: { ...nn.visuals, backgroundAssetId: bgId } }
+              })()
+            : n
+        )
+      }))
+      const checkUrl = nextUri
+      try {
+        const resp = await fetch(checkUrl, { method: 'HEAD' })
+        if (!resp.ok) {
+          setToast('已上传背景，但访问失败（检查 server 静态路径）')
+        } else {
+          setToast('已更新背景图片')
+        }
+      } catch {
+        setToast('已上传背景，但访问失败（检查 server 静态路径）')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    rtRef.current = rt
+  }, [rt])
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        setProjects(await listProjects())
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      }
+    })()
+  }, [])
+  useEffect(() => {
+    const host = canvasHostRef.current
+    if (!host) return
+
+    let disposed = false
+    let app: Application | null = null
+
+    // track viewport size for DOM overlay (virtual stage)
+    try {
+      const update = () => setCanvasSize({ w: Math.max(0, host.clientWidth), h: Math.max(0, host.clientHeight) })
+      update()
+      const ro = new ResizeObserver(() => update())
+      ro.observe(host)
+      ;(host as any).__gs_ro = ro
+    } catch {}
+
+    void (async () => {
+      try {
+        const a = new Application()
+        await a.init({ backgroundAlpha: 0, resizeTo: host, antialias: true })
+        if (disposed) {
+          try {
+            a.destroy(true)
+          } catch {}
+          return
+        }
+        host.appendChild(a.canvas)
+        appRef.current = a
+        app = a
+      } catch (e) {
+        try {
+          console.error('[game_studio] pixi init failed:', e)
+        } catch {}
+      }
+    })()
+
+    return () => {
+      disposed = true
+      try {
+        const ro = (host as any).__gs_ro as ResizeObserver | undefined
+        if (ro) ro.disconnect()
+        delete (host as any).__gs_ro
+      } catch {}
+      try {
+        if (appRef.current === app) appRef.current = null
+      } catch {}
+      try {
+        app?.destroy(true)
+      } catch {}
+      try {
+        host.replaceChildren()
+      } catch {}
+    }
+  }, [])
+
+  const nodes = useMemo(() => (doc.story?.nodes ? doc.story.nodes : []), [doc.story])
+  const nodeById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes])
+  const blueprintNodeIdSet = useMemo(() => new Set(blueprintNodeIds), [blueprintNodeIds])
+  const scriptCardById = useMemo(() => {
+    const entries: [string, any][] = []
+    for (const c of scriptsDoc?.cards || []) {
+      const id = String((c as any)?.id || '').trim()
+      if (!id) continue
+      entries.push([id, c])
+    }
+    return new Map<string, any>(entries)
+  }, [scriptsDoc])
+
+  const nodesForList = useMemo(() => {
+    const list = nodes.slice()
+    list.sort((a: any, b: any) => {
+      if (String(a.kind || '') !== String(b.kind || '')) return String(a.kind || '') === 'scene' ? -1 : 1
+      const sa = String(a.blueprint?.scriptCardId || '')
+      const sb = String(b.blueprint?.scriptCardId || '')
+      const oa = Number((scriptCardById.get(sa) as any)?.order ?? 1e9)
+      const ob = Number((scriptCardById.get(sb) as any)?.order ?? 1e9)
+      if (oa !== ob) return oa - ob
+      return String(a.name || a.id).localeCompare(String(b.name || b.id))
+    })
+    return list
+  }, [nodes, scriptCardById])
+
+  const nodeLabel = (n: any) => {
+    if (String(n.kind || '') !== 'scene') return String(n.name || n.id)
+    const sc = scriptCardById.get(String(n.blueprint?.scriptCardId || ''))
+    return scriptCardLabel(sc) || String(n.name || n.id)
+  }
+
+  useEffect(() => {
+    if (selection.type === 'node') setPreviewNodeId(selection.id)
+  }, [selection])
+
+  const effectivePreviewNode = useMemo(() => {
+    const id = previewNodeId
+    if (id) return nodeById.get(id) || null
+    if (doc.story?.startNodeId) return nodeById.get(doc.story.startNodeId) || null
+    return null
+  }, [doc.story?.startNodeId, nodeById, previewNodeId])
+
+  const stageViewport = useMemo(() => {
+    if (!doc.project) return null
+    const viewW = canvasSize.w || appRef.current?.renderer.width || 0
+    const viewH = canvasSize.h || appRef.current?.renderer.height || 0
+    if (!viewW || !viewH) return null
+    return computeStageViewport((doc.project as any).stage as StageConfigV1 | undefined, viewW, viewH)
+  }, [canvasSize.h, canvasSize.w, doc.project])
+
+  useEffect(() => {
+    clearRuntimeTimers()
+    if (!doc.project || !doc.story || !effectivePreviewNode) return
+    const node = ensureNode(effectivePreviewNode)
+    setRt((prev) => runTimelineStable(enterNodeRuntime(prev), node))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc.id, effectivePreviewNode])
+
+  useEffect(() => {
+    const app = appRef.current
+    if (!app) return
+    const node = effectivePreviewNode ? ensureNode(effectivePreviewNode) : null
+    stageRenderSeqRef.current += 1
+    const seq = stageRenderSeqRef.current
+    void renderStage({
+      app,
+      doc,
+      node,
+      stageOverride: rt.stageOverride,
+      isStale: () => stageRenderSeqRef.current !== seq
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc, effectivePreviewNode, rt.stageOverride])
+
+  useEffect(() => {
+    if (!doc.project || !doc.story || !effectivePreviewNode) return
+    clearRuntimeTimers()
+
+    const node = ensureNode(effectivePreviewNode)
+    const wait = rt.wait
+
+    if (wait.kind === 'timer') {
+      const ms = Math.max(0, Math.floor(Number(wait.ms || 0)))
+      rtTimersRef.current.timeoutId = window.setTimeout(() => {
+        setRt((prev) => runTimelineStable({ ...prev, stepIndex: prev.stepIndex + 1, wait: { kind: 'auto' } }, node))
+      }, ms)
+      return () => clearRuntimeTimers()
+    }
+
+    if (wait.kind === 'condition') {
+      const pollMs = Math.max(50, Math.floor(Number(wait.pollMs || 200)))
+      rtTimersRef.current.pollId = window.setInterval(() => {
+        const cur = rtRef.current
+        if (evalConditionExpr(wait.expr, cur.vars)) {
+          clearRuntimeTimers()
+          setRt((prev) => runTimelineStable({ ...prev, stepIndex: prev.stepIndex + 1, wait: { kind: 'auto' } }, node))
+        }
+      }, pollMs)
+      return () => clearRuntimeTimers()
+    }
+
+    return () => clearRuntimeTimers()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doc.id, effectivePreviewNode?.id, rt.wait])
+
+  useEffect(() => {
+    const nav = rt.nav
+    if (!nav) return
+    if (!doc.story) return
+
+    if (nav.type === 'gotoNode') {
+      const delay = Number.isFinite(Number(nav.delayMs)) ? Math.max(0, Math.floor(Number(nav.delayMs))) : 0
+      window.setTimeout(() => setSelection({ type: 'node', id: nav.nodeId }), delay)
+    } else if (nav.type === 'restart') {
+      const defaults = buildDefaultVars(doc.project?.state?.vars)
+      setRt((prev) => ({ ...prev, vars: defaults, eventMemory: {}, stageOverride: {}, nav: null }))
+      setSelection({ type: 'node', id: runtimeStartNodeId || doc.story.startNodeId })
+    } else if (nav.type === 'backToHub') {
+      try {
+        if (props.onBackToHub) {
+          props.onBackToHub()
+        } else {
+          window.location.reload()
+        }
+      } catch {
+        window.location.reload()
+      }
+    }
+
+    setRt((prev) => ({ ...prev, nav: null }))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rt.nav])
+
+  useEffect(() => {
+    if (!toast) return
+    const t = window.setTimeout(() => setToast(''), 2200)
+    return () => window.clearTimeout(t)
+  }, [toast])
+
+  useEffect(() => {
+    if (!rt.toast) return
+    const t = window.setTimeout(() => setRt((prev) => ({ ...prev, toast: '' })), 2200)
+    return () => window.clearTimeout(t)
+  }, [rt.toast])
+
+  function setDocProject(updater: (p: ProjectV1) => ProjectV1) {
+    setDoc((prev) => {
+      if (!prev.project) return prev
+      return { ...prev, project: updater(prev.project) }
+    })
+    setDirty(true)
+  }
+
+  function setDocStory(updater: (s: StoryV1) => StoryV1) {
+    setDoc((prev) => {
+      if (!prev.story) return prev
+      return { ...prev, story: updater(prev.story) }
+    })
+    setDirty(true)
+  }
+
+  async function refreshProjects() {
+    setBusy(true)
+    setError('')
+    try {
+      setProjects(await listProjects())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!props.projectId) return
+    // 由上层工作流进入合成层时，自动打开指定项目
+    if (doc.mode === 'project' && doc.id === props.projectId) return
+    void openProject(String(props.projectId))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.projectId])
+
+  async function openProject(id: string) {
+    setBusy(true)
+    setError('')
+    try {
+      const data = await getProject(id)
+      let bpLoaded = false
+      let bpNodeIds: string[] = []
+      try {
+        const [bp, sc] = await Promise.all([getBlueprint(id), getScripts(id)])
+        bpLoaded = true
+        bpNodeIds = Array.isArray((bp as any).nodes) ? (bp as any).nodes.map((x: any) => String(x && x.id || '')).filter(Boolean) : []
+        setScriptsDoc(sc)
+      } catch {
+        bpLoaded = false
+        bpNodeIds = []
+        setScriptsDoc(null)
+      }
+      const project = normalizeProjectV1(data.project as any)
+      const story = normalizeStoryV1(data.story as any)
+      setRt((prev) => ({ ...prev, vars: buildDefaultVars(project.state?.vars), eventMemory: {}, stageOverride: {}, nav: null }))
+      setRuntimeStartNodeId(story.startNodeId)
+      setBlueprintLoaded(bpLoaded)
+      setBlueprintNodeIds(bpNodeIds)
+      setDoc({
+        mode: 'project',
+        readonly: false,
+        id: project.id,
+        title: project.title,
+        assetBase: resolveUrl(`/project-assets/${encodeURIComponent(project.id)}/`),
+        project,
+        story
+      })
+      setSelection({ type: 'node', id: story.startNodeId })
+      setLeftTab('nodes')
+      setDirty(false)
+      setToast('项目已打开')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function createNewProject() {
+    const title = window.prompt('新项目名称', '未命名故事')
+    if (!title) return
+
+    setBusy(true)
+    setError('')
+    try {
+      const p = await createProject(title)
+      await refreshProjects()
+      await openProject(p.id)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function saveCurrent() {
+    if (doc.mode !== 'project' || !doc.project || !doc.story) return
+    setBusy(true)
+    setError('')
+    try {
+      const p = await saveProject(doc.id, { project: doc.project, story: doc.story })
+      setDoc((prev) => ({ ...prev, project: p, title: p.title }))
+      setDirty(false)
+      setToast('已保存')
+      await refreshProjects()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function saveIfDirty(): Promise<boolean> {
+    if (busy) return false
+    if (doc.mode !== 'project' || !dirty) return true
+    try {
+      await saveCurrent()
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async function exportCurrent() {
+    if (doc.mode !== 'project' || !doc.project) return
+    setBusy(true)
+    setError('')
+    try {
+      const { distUrl } = await exportProject(doc.id)
+      window.open(resolveUrl(distUrl), '_blank', 'noopener,noreferrer')
+      setToast('已导出并打开预览')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function backToStart() {
+    if (!doc.story) return
+    setSelection({ type: 'node', id: doc.story.startNodeId })
+  }
+
+  function restartRuntime() {
+    if (!doc.story) return
+    const defaults = buildDefaultVars(doc.project?.state?.vars)
+    clearRuntimeTimers()
+    setRt((prev) => ({ ...prev, vars: defaults, eventMemory: {}, stageOverride: {}, nav: null }))
+    setSelection({ type: 'node', id: runtimeStartNodeId || doc.story.startNodeId })
+  }
+
+  function clearRuntimeTimers() {
+    const t = rtTimersRef.current
+    if (t.timeoutId != null) {
+      window.clearTimeout(t.timeoutId)
+      t.timeoutId = null
+    }
+    if (t.pollId != null) {
+      window.clearInterval(t.pollId)
+      t.pollId = null
+    }
+  }
+
+  function enterNodeRuntime(prev: RuntimeState): RuntimeState {
+    return {
+      ...prev,
+      stepIndex: 0,
+      text: '',
+      toast: '',
+      endingCard: null,
+      wait: { kind: 'auto' },
+      stageOverride: {},
+      nav: null
+    }
+  }
+
+  function applyTimelineAction(state: RuntimeState, action: TimelineActionV1, events: ProjectEventV1[], depth: number): RuntimeState {
+    const t = String((action as any)?.type || '').trim()
+    if (!t) return state
+    if (state.nav) return state
+
+    if (t === 'ui.setText') {
+      const mode = String((action as any).mode || 'replace')
+      const text = String((action as any).text ?? '')
+      return { ...state, text: mode === 'append' ? `${state.text}${text}` : text }
+    }
+    if (t === 'ui.appendText') {
+      const text = String((action as any).text ?? '')
+      return { ...state, text: `${state.text}${text}` }
+    }
+    if (t === 'ui.clearText') return { ...state, text: '' }
+    if (t === 'ui.toast') return { ...state, toast: String((action as any).text ?? '') }
+
+    if (t === 'ui.showEndingCard') {
+      const card = (action as any).card as EndingCardV1
+      return { ...state, endingCard: card || null, wait: { kind: 'end' } }
+    }
+
+    if (t === 'flow.gotoNode') {
+      const nodeId = String((action as any).nodeId || '').trim()
+      if (!nodeId) return state
+      return { ...state, nav: { type: 'gotoNode', nodeId } }
+    }
+    if (t === 'flow.restart') return { ...state, nav: { type: 'restart' } }
+    if (t === 'flow.backToHub') return { ...state, nav: { type: 'backToHub', url: (action as any).url } }
+    if (t === 'flow.stopTimeline') return { ...state, wait: { kind: 'end' } }
+
+    if (t === 'event.call') {
+      if (depth >= 8) return { ...state, toast: state.toast || '事件嵌套过深，已中止' }
+      const eventId = String((action as any).eventId || '').trim()
+      if (!eventId) return state
+      const ev = events.find((e) => String(e && (e as any).id) === eventId) || null
+      if (!ev) return { ...state, toast: state.toast || `事件不存在：${eventId}` }
+      const acts = Array.isArray((ev as any).actions) ? (ev as any).actions : []
+      let next = state
+      for (const a of acts) {
+        next = applyTimelineAction(next, a as any, events, depth + 1)
+        if (next.nav) break
+      }
+      return next
+    }
+    if (t === 'events.emit') {
+      const name = String((action as any).name || '').trim()
+      if (!name) return state
+      const payload = (action as any).payload
+      return { ...state, eventMemory: { ...state.eventMemory, [name]: payload ?? true } }
+    }
+
+    if (t === 'state.set') {
+      const k = String((action as any).var || '').trim()
+      if (!k) return state
+      return { ...state, vars: { ...state.vars, [k]: (action as any).value } }
+    }
+    if (t === 'state.add' || t === 'state.inc') {
+      const k = String((action as any).var || '').trim()
+      if (!k) return state
+      const delta = t === 'state.inc' ? Number((action as any).value ?? 1) : Number((action as any).value ?? 0)
+      const prev = Number(state.vars[k] ?? 0)
+      const next = (Number.isFinite(prev) ? prev : 0) + (Number.isFinite(delta) ? delta : 0)
+      return { ...state, vars: { ...state.vars, [k]: next } }
+    }
+    if (t === 'state.toggle') {
+      const k = String((action as any).var || '').trim()
+      if (!k) return state
+      return { ...state, vars: { ...state.vars, [k]: !Boolean(state.vars[k]) } }
+    }
+    if (t === 'state.tags.add' || t === 'state.tags.remove') {
+      const k = String((action as any).var || '').trim()
+      const v = String((action as any).value || '').trim()
+      if (!k || !v) return state
+      const list = Array.isArray(state.vars[k]) ? state.vars[k].map(String) : []
+      const set = new Set(list)
+      if (t === 'state.tags.add') set.add(v)
+      else set.delete(v)
+      return { ...state, vars: { ...state.vars, [k]: Array.from(set) } }
+    }
+
+    if (t === 'stage.setBackground') {
+      const assetId = (action as any).assetId ? String((action as any).assetId) : undefined
+      return { ...state, stageOverride: { ...state.stageOverride, backgroundAssetId: assetId } }
+    }
+    if (t === 'stage.setPlacements') {
+      const placements = Array.isArray((action as any).placements) ? (action as any).placements : []
+      return { ...state, stageOverride: { ...state.stageOverride, placements } }
+    }
+
+    return state
+  }
+
+  function runTimelineStable(prev: RuntimeState, node: NodeV1): RuntimeState {
+    if (!doc.project) return prev
+    const projectEvents = Array.isArray(doc.project.events) ? doc.project.events : []
+    const steps = Array.isArray((node as any).timeline?.steps) ? ((node as any).timeline.steps as any[]) : []
+
+    let state: RuntimeState = {
+      ...prev,
+      vars: { ...prev.vars },
+      eventMemory: { ...prev.eventMemory },
+      stageOverride: { ...prev.stageOverride },
+      nav: null
+    }
+
+    const maxAuto = 60
+    let guard = 0
+    while (guard++ < maxAuto) {
+      if (state.nav) return state
+      if (state.endingCard) return { ...state, wait: { kind: 'end' } }
+
+      const step = steps[state.stepIndex] || null
+      if (!step) {
+        if (node.kind === 'scene' && Array.isArray(node.choices) && node.choices.length) return { ...state, wait: { kind: 'choice' } }
+        if (node.kind === 'ending') return { ...state, wait: { kind: 'end' }, endingCard: state.endingCard || defaultEndingCardForNode(node) }
+        return { ...state, wait: { kind: 'end' } }
+      }
+
+      const actions = Array.isArray(step.actions) ? step.actions : []
+      for (const a of actions) {
+        state = applyTimelineAction(state, a as any, projectEvents, 0)
+        if (state.nav) return state
+        if (state.endingCard) return { ...state, wait: { kind: 'end' } }
+      }
+
+      const adv = normalizeAdvance(step.advance)
+      const type = String((adv as any).type || 'auto')
+
+      if (type === 'auto') {
+        state = { ...state, stepIndex: state.stepIndex + 1, wait: { kind: 'auto' } }
+        continue
+      }
+      if (type === 'click') {
+        const cs = node.kind === 'scene' && Array.isArray(node.choices) ? node.choices : []
+        if (cs.length) return { ...state, wait: { kind: 'choice' } }
+        return { ...state, wait: { kind: 'click' } }
+      }
+      if (type === 'choice') {
+        const cs = Array.isArray(node.choices) ? node.choices : []
+        return cs.length ? { ...state, wait: { kind: 'choice' } } : { ...state, wait: { kind: 'click' }, toast: state.toast || '未配置选项，已降级为「点击继续」' }
+      }
+      if (type === 'timer') {
+        const ms = Math.max(0, Math.floor(Number((adv as any).ms ?? 0)))
+        return { ...state, wait: { kind: 'timer', ms } }
+      }
+      if (type === 'event') {
+        const name = String((adv as any).name || '').trim()
+        if (!name) return { ...state, wait: { kind: 'click' }, toast: state.toast || 'event 缺少 name，已降级为「点击继续」' }
+        if (name && Object.prototype.hasOwnProperty.call(state.eventMemory, name)) {
+          const nextMem = { ...state.eventMemory }
+          try {
+            delete nextMem[name]
+          } catch {}
+          state = { ...state, stepIndex: state.stepIndex + 1, eventMemory: nextMem, wait: { kind: 'auto' } }
+          continue
+        }
+        return { ...state, wait: { kind: 'event', name } }
+      }
+      if (type === 'condition') {
+        const expr = (adv as any).expr as any
+        if (!expr) return { ...state, wait: { kind: 'click' }, toast: state.toast || 'condition 缺少 expr，已降级为「点击继续」' }
+        const pollMsRaw = Number((adv as any).pollMs)
+        const pollMs = Number.isFinite(pollMsRaw) && pollMsRaw > 0 ? Math.floor(pollMsRaw) : 200
+        if (evalConditionExpr(expr, state.vars)) {
+          state = { ...state, stepIndex: state.stepIndex + 1, wait: { kind: 'auto' } }
+          continue
+        }
+        return { ...state, wait: { kind: 'condition', expr, pollMs } }
+      }
+      if (type === 'end') {
+        if (node.kind === 'ending') return { ...state, wait: { kind: 'end' }, endingCard: state.endingCard || defaultEndingCardForNode(node) }
+        return { ...state, wait: { kind: 'end' } }
+      }
+
+      return { ...state, wait: { kind: 'click' } }
+    }
+
+    return { ...state, wait: { kind: 'end' }, toast: state.toast || '运行时：auto 步骤过多，已中止' }
+  }
+
+  function ensureNode(n: NodeV1): NodeV1 {
+    const base = ensureTimelineForNode(n)
+    const visuals = base.visuals || {}
+    const placements = Array.isArray(visuals.placements) ? visuals.placements : []
+    const choices = base.kind === 'scene' ? (Array.isArray(base.choices) ? base.choices : []) : undefined
+    const normalizedChoices = choices
+      ? choices.map((c) => ({
+          ...c,
+          id: String((c as any).id || ''),
+          text: String((c as any).text || ''),
+          toNodeId: String((c as any).toNodeId || ''),
+          effects: Array.isArray((c as any).effects) ? (c as any).effects : [],
+          visibleWhen: (c as any).visibleWhen ?? null,
+          enabledWhen: (c as any).enabledWhen ?? null
+        }))
+      : undefined
+    return { ...base, choices: normalizedChoices, visuals: { ...visuals, placements } }
+  }
+
+  function addNode(kind: NodeV1['kind']) {
+    if (!doc.story || doc.readonly) return
+    window.alert('合成层禁止新增节点；请返回蓝图层调整结构。')
+  }
+
+  function deleteNode(nodeId: string) {
+    if (!doc.story || doc.readonly) return
+    window.alert('合成层禁止删除节点；请返回蓝图层调整结构。')
+  }
+
+  function addCharacter() {
+    if (!doc.project || doc.readonly) return
+
+    const id = uid('ch')
+    const ch: CharacterV1 = { id, name: '新角色' }
+    setDocProject((p) => ({ ...p, characters: [...p.characters, ch] }))
+    setSelection({ type: 'character', id })
+    setLeftTab('characters')
+  }
+
+  function deleteCharacter(characterId: string) {
+    if (!doc.project || !doc.story || doc.readonly) return
+    if (!window.confirm('确定删除该角色？')) return
+
+    setDocProject((p) => ({ ...p, characters: p.characters.filter((c) => c.id !== characterId) }))
+    setDocStory((s) => ({
+      ...s,
+      nodes: s.nodes.map((n) => {
+        const nn = ensureNode(n)
+        const next = (nn.visuals?.placements || []).filter((p) => p.characterId !== characterId)
+        return { ...nn, visuals: { ...nn.visuals, placements: next } }
+      })
+    }))
+
+    if (selection.type === 'character' && selection.id === characterId) setSelection({ type: 'none' })
+  }
+
+  function addAsset() {
+    if (!doc.project || doc.readonly) return
+
+    const id = uid('asset')
+    const a: AssetV1 = { id, kind: 'image', name: '新资源', uri: '' }
+    setDocProject((p) => ({ ...p, assets: [...p.assets, a] }))
+    setSelection({ type: 'asset', id })
+    setLeftTab('assets')
+  }
+
+  function deleteAsset(assetId: string) {
+    if (!doc.project || !doc.story || doc.readonly) return
+    if (!window.confirm('确定删除该资源？（引用会被清空）')) return
+
+    setDocProject((p) => ({
+      ...p,
+      assets: p.assets.filter((a) => a.id !== assetId),
+      characters: p.characters.map((ch) => (ch.imageAssetId === assetId ? { ...ch, imageAssetId: undefined } : ch))
+    }))
+
+    setDocStory((s) => ({
+      ...s,
+      nodes: s.nodes.map((n) => {
+        const nn = ensureNode(n)
+        const bg = nn.visuals?.backgroundAssetId === assetId ? undefined : nn.visuals?.backgroundAssetId
+        const pls = Array.isArray(nn.visuals?.placements) ? nn.visuals!.placements! : []
+        const nextPls = pls.map((p) => (p.imageAssetId === assetId ? { ...p, imageAssetId: undefined } : p))
+        return { ...nn, visuals: { ...nn.visuals, backgroundAssetId: bg, placements: nextPls } }
+      })
+    }))
+
+    if (selection.type === 'asset' && selection.id === assetId) setSelection({ type: 'none' })
+  }
+
+  function stageDims() {
+    const st = normalizeStageV1((doc.project as any)?.stage)
+    return { w: Math.max(1, Math.floor(Number(st.width || 720))), h: Math.max(1, Math.floor(Number(st.height || 1280))) }
+  }
+
+  function buildNodeTextSummary(textRaw: string) {
+    const lines = String(textRaw || '')
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+    const picked: string[] = []
+    for (const ln of lines) {
+      if (/^选项(?:\d{1,2}|[A-Z])\s*[:：]/i.test(ln)) break
+      picked.push(ln)
+      if (picked.length >= 8) break
+    }
+    return picked.join('，').replace(/\s+/g, ' ').trim()
+  }
+
+  function buildCharacterContextText(characterId: string) {
+    if (!doc.story || !doc.project) return ''
+    const ch = (doc.project.characters || []).find((x) => x.id === characterId) || null
+    if (!ch) return ''
+    const name = String(ch.name || '').trim()
+    const out: string[] = []
+    for (const n of doc.story.nodes || []) {
+      const nn = ensureNode(n as any)
+      const placements = Array.isArray(nn.visuals?.placements) ? nn.visuals!.placements! : []
+      const hasPlacement = placements.some((p) => p.characterId === characterId)
+      const textRaw = String((nn as any).body?.text || '').trim()
+      const hasName = name ? textRaw.includes(name) : false
+      if (!hasPlacement && !hasName) continue
+      const sum = buildNodeTextSummary(textRaw)
+      if (sum) out.push(`${String((nn as any).name || nn.id)}：${sum}`)
+      if (out.length >= 3) break
+    }
+    return out.join('\n').slice(0, 900)
+  }
+
+  function buildSceneCharacterLocks(node: NodeV1 | null) {
+    if (!node || !doc.project) return ''
+    const placements = Array.isArray((node as any).visuals?.placements) ? ((node as any).visuals.placements as any[]) : []
+    const ids: string[] = []
+    for (const p of placements) {
+      const id = String(p && p.characterId || '').trim()
+      if (id) ids.push(id)
+    }
+    const uniq = Array.from(new Set(ids))
+    const fps: string[] = []
+    for (const id of uniq) {
+      const ch = (doc.project.characters || []).find((x) => x.id === id) || null
+      const fp = String(ch && ch.ai && ch.ai.fingerprintPrompt ? ch.ai.fingerprintPrompt : '').replace(/\s+/g, ' ').trim()
+      if (fp) fps.push(fp)
+    }
+    if (!fps.length) return ''
+    return `角色设定（用于一致性锁定，非每个场景都出现）：${fps.join('；')}`.slice(0, 1200)
+  }
+
+  async function runCharacterFingerprint(characterId: string) {
+    if (!doc.project || !doc.story || doc.mode !== 'project') return
+    const ch = (doc.project.characters || []).find((x) => x.id === characterId) || null
+    if (!ch) return
+    const characterName = String(ch.name || ch.id).trim()
+    if (!characterName) {
+      setChFpError('请先填写角色名称')
+      return
+    }
+    setChFpBusy(true)
+    setChFpError('')
+    try {
+      const ctx = buildCharacterContextText(characterId)
+      const res = await analyzeCharacterFingerprintAi(doc.id, {
+        storyTitle: String((doc.project as any).title || '').trim(),
+        characterName,
+        contextText: ctx,
+        globalPrompt: String(aiReq.globalPrompt || '').trim(),
+        style: String(aiReq.style || 'picture_book')
+      })
+      const fp = String(res.result?.fingerprintPrompt || '').trim()
+      const neg = String(res.result?.negativePrompt || '').trim()
+      if (!fp) throw new Error('AI 未返回 fingerprintPrompt')
+
+      setDocProject((p) => ({
+        ...p,
+        characters: (p.characters || []).map((x) =>
+          x.id === characterId ? { ...x, ai: { ...(x.ai || {}), fingerprintPrompt: fp, negativePrompt: neg } } : x
+        )
+      }))
+      setToast('已提取角色设定（指纹）')
+    } catch (e) {
+      setChFpError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setChFpBusy(false)
+    }
+  }
+
+  function openCharacterSpriteModal(characterId: string, posePrompt?: string) {
+    if (!doc.project || doc.mode !== 'project') return
+    const ch = (doc.project.characters || []).find((x) => x.id === characterId) || null
+    if (!ch) return
+    const dims = stageDims()
+    const fp = String(ch.ai?.fingerprintPrompt || '').trim()
+    const neg = String(ch.ai?.negativePrompt || '').trim()
+    const basePose = String(posePrompt || '').trim() || '全身，站立，面朝镜头，单人，居中'
+    const st0 = (doc.project as any).state && typeof (doc.project as any).state === 'object' ? (doc.project as any).state : {}
+    const aiBg0 = (st0 as any).aiBackground && typeof (st0 as any).aiBackground === 'object' ? (st0 as any).aiBackground : {}
+    const gpSaved = typeof (aiBg0 as any).globalPrompt === 'string' ? String((aiBg0 as any).globalPrompt) : ''
+    const projectTitle = String((doc.project as any).title || '').trim()
+    const gpFallback = gpSaved.trim() ? gpSaved : (projectTitle ? `故事名：《${projectTitle}》` : '')
+    const gpUse = String(aiReq.globalPrompt || '').trim() || gpFallback
+    chTargetRef.current = { kind: 'character', characterId }
+    setChGreen(null)
+    setChTransparentPreviewUrl('')
+    setChError('')
+    setChDraft({
+      ...defaultChDraft,
+      globalPrompt: gpUse,
+      fingerprintPrompt: fp,
+      posePrompt: basePose,
+      negativePrompt: neg,
+      style: (aiReq.style as any) || 'picture_book',
+      width: dims.w,
+      height: dims.h
+    })
+    setChOpen(true)
+  }
+
+  function openPlacementSpriteModal(args: { nodeId: string; placementId: string; characterId: string; posePrompt?: string }) {
+    if (!doc.project || !doc.story || doc.mode !== 'project') return
+    const ch = (doc.project.characters || []).find((x) => x.id === args.characterId) || null
+    if (!ch) return
+    const fp = String(ch.ai?.fingerprintPrompt || '').trim()
+    const neg = String(ch.ai?.negativePrompt || '').trim()
+    const dims = stageDims()
+    const st0 = (doc.project as any).state && typeof (doc.project as any).state === 'object' ? (doc.project as any).state : {}
+    const aiBg0 = (st0 as any).aiBackground && typeof (st0 as any).aiBackground === 'object' ? (st0 as any).aiBackground : {}
+    const gpSaved = typeof (aiBg0 as any).globalPrompt === 'string' ? String((aiBg0 as any).globalPrompt) : ''
+    const projectTitle = String((doc.project as any).title || '').trim()
+    const gpFallback = gpSaved.trim() ? gpSaved : (projectTitle ? `故事名：《${projectTitle}》` : '')
+    const gpUse = String(aiReq.globalPrompt || '').trim() || gpFallback
+
+    let pose = String(args.posePrompt || '').trim()
+    if (!pose) {
+      const n0 = (doc.story.nodes || []).find((n) => n.id === args.nodeId) || null
+      const nn = n0 ? ensureNode(n0 as any) : null
+      const title = nn ? String((nn as any).body?.title || '').trim() : ''
+      const sum = nn ? buildNodeTextSummary(String((nn as any).body?.text || '').trim()) : ''
+      pose = [title, sum].filter(Boolean).join('，').slice(0, 400)
+    }
+    if (!pose) pose = '全身，站立，单人，居中'
+
+    chTargetRef.current = { kind: 'placement', characterId: args.characterId, nodeId: args.nodeId, placementId: args.placementId }
+    setChGreen(null)
+    setChTransparentPreviewUrl('')
+    setChError('')
+    setChDraft({
+      ...defaultChDraft,
+      globalPrompt: gpUse,
+      fingerprintPrompt: fp,
+      posePrompt: pose,
+      negativePrompt: neg,
+      style: (aiReq.style as any) || 'picture_book',
+      width: dims.w,
+      height: dims.h
+    })
+    setChOpen(true)
+  }
+
+  async function generateCharacterGreen() {
+    if (doc.mode !== 'project') return
+    setChBusy(true)
+    setChError('')
+    try {
+      const res = await generateCharacterSpriteAi(doc.id, {
+        globalPrompt: String(chDraft.globalPrompt || '').trim(),
+        fingerprintPrompt: String(chDraft.fingerprintPrompt || '').trim(),
+        posePrompt: String(chDraft.posePrompt || '').trim(),
+        negativePrompt: String(chDraft.negativePrompt || '').trim(),
+        style: String(chDraft.style || 'picture_book'),
+        width: Number(chDraft.width || 720),
+        height: Number(chDraft.height || 1280),
+        steps: Number(chDraft.steps || 20),
+        cfgScale: Number(chDraft.cfgScale || 7)
+      })
+      const abs = res.url ? resolveUrl(res.url) : res.assetPath
+      setChGreen({ url: abs, assetPath: res.assetPath, provider: res.provider, remoteUrl: res.remoteUrl })
+      setToast('已生成绿幕图，可继续抠图并应用')
+    } catch (e) {
+      setChError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setChBusy(false)
+    }
+  }
+
+  async function applyCharacterTransparent() {
+    if (doc.mode !== 'project' || !doc.project || !doc.story) return
+    const target = chTargetRef.current
+    if (!target) {
+      setChError('内部错误：缺少应用目标')
+      return
+    }
+    const greenUrl = String(chGreen && chGreen.url ? chGreen.url : '').trim()
+    if (!greenUrl) {
+      setChError('请先生成绿幕图')
+      return
+    }
+
+    setChBusy(true)
+    setChError('')
+    try {
+      const matte = await chromaKeyUrlToPng(greenUrl, {
+        threshold: Number(chDraft.keyThreshold || 80),
+        feather: Number(chDraft.keyFeather || 40),
+        crop: Boolean(chDraft.crop),
+        padding: Number(chDraft.padding || 12)
+      })
+
+      try {
+        const u0 = String(chTransparentPreviewUrl || '').trim()
+        if (u0) URL.revokeObjectURL(u0)
+      } catch {}
+      const previewUrl = URL.createObjectURL(matte.blob)
+      setChTransparentPreviewUrl(previewUrl)
+
+      const ch = (doc.project.characters || []).find((x) => x.id === target.characterId) || null
+      const safeName = String(ch?.name || ch?.id || 'character').replace(/[^a-zA-Z0-9_\u4e00-\u9fa5-]+/g, '_').slice(0, 24) || 'character'
+      const fileName = `${safeName}_${Date.now()}.png`
+      const file = new File([matte.blob], fileName, { type: 'image/png' })
+      const uploaded = await uploadProjectImage(String(doc.project.id), file)
+      const nextUri = uploaded.url ? resolveUrl(uploaded.url) : uploaded.assetPath
+
+      const usedPrompt = [String(chDraft.globalPrompt || '').trim(), String(chDraft.fingerprintPrompt || '').trim(), String(chDraft.posePrompt || '').trim()]
+        .filter(Boolean)
+        .join('，')
+        .slice(0, 1800)
+      const provider = (chGreen && chGreen.provider ? String(chGreen.provider) : '') as any
+
+      const applyToAsset = (assetId: string) => {
+        setDocProject((p) => ({
+          ...p,
+          assets: (p.assets || []).map((a) =>
+            a.id === assetId
+              ? { ...a, uri: nextUri, source: { type: 'ai' as const, prompt: usedPrompt, provider } }
+              : a
+          )
+        }))
+        return assetId
+      }
+
+      const createAsset = (name: string) => {
+        const assetId = uid('asset')
+        const asset: AssetV1 = {
+          id: assetId,
+          kind: 'image',
+          name,
+          uri: nextUri,
+          source: { type: 'ai' as const, prompt: usedPrompt, provider }
+        }
+        setDocProject((p) => ({ ...p, assets: [...(p.assets || []), asset] }))
+        return assetId
+      }
+
+      if (target.kind === 'character') {
+        const existingId = String(ch?.imageAssetId || '').trim()
+        const existing = existingId ? (doc.project.assets || []).find((a) => a.id === existingId) || null : null
+        const assetId = existing ? applyToAsset(existingId) : createAsset(`AI 角色 ${ch?.name || ch?.id || ''}`.trim() || 'AI 角色')
+        setDocProject((p) => ({
+          ...p,
+          characters: (p.characters || []).map((x) => (x.id === target.characterId ? { ...x, imageAssetId: assetId } : x))
+        }))
+        setToast('已生成透明 PNG 并应用到角色')
+        return
+      }
+
+      if (target.kind === 'placement') {
+        const nodeId = String(target.nodeId || '').trim()
+        const placementId = String(target.placementId || '').trim()
+        const node0 = (doc.story.nodes || []).find((n) => n.id === nodeId) || null
+        const nn = node0 ? ensureNode(node0 as any) : null
+        const placements = Array.isArray(nn?.visuals?.placements) ? (nn!.visuals!.placements as any[]) : []
+        const pl = placements.find((p) => String(p && p.id) === placementId) || null
+        const existingId = String(pl && pl.imageAssetId ? pl.imageAssetId : '').trim()
+        const existing = existingId ? (doc.project.assets || []).find((a) => a.id === existingId) || null : null
+        const nodeName = String((node0 as any)?.name || nodeId).trim()
+        const assetId =
+          existing ? applyToAsset(existingId) : createAsset(`AI 姿势 ${nodeName} · ${ch?.name || ch?.id || ''}`.trim() || 'AI 姿势')
+
+        setDocStory((s) => ({
+          ...s,
+          nodes: (s.nodes || []).map((n) => {
+            if (n.id !== nodeId) return n
+            const n2 = ensureNode(n as any)
+            const v0 = n2.visuals || {}
+            const pls = Array.isArray(v0.placements) ? v0.placements : []
+            const next = pls.map((pp) => (pp.id === placementId ? { ...pp, imageAssetId: assetId } : pp))
+            return { ...n2, visuals: { ...v0, placements: next } }
+          })
+        }))
+        setToast('已生成透明 PNG 并应用到该摆放（覆盖）')
+        return
+      }
+    } catch (e) {
+      setChError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setChBusy(false)
+    }
+  }
+
+  const problems = useMemo(() => {
+    try {
+      return validate(doc)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      return [`配置格式错误：${msg}`]
+    }
+  }, [doc])
+
+  const right = (() => {
+    if (!doc.project || !doc.story) {
+      return (
+        <div className="section">
+          <div className="hint">右侧是唯一编辑入口：请选择项目后开始。</div>
+          {error ? <div style={{ marginTop: 10, color: '#fca5a5' }}>{error}</div> : null}
+        </div>
+      )
+    }
+
+    if (doc.readonly) {
+      return (
+        <div className="section">
+          <div className="hint">当前为示例（只读）。如需编辑，请新建/打开项目。</div>
+        </div>
+      )
+    }
+
+    if (selection.type === 'node') {
+      const n0 = nodeById.get(selection.id) || null
+      if (!n0) return <div className="section"><div className="hint">节点不存在</div></div>
+      const n = ensureNode(n0)
+      const fromBlueprint = blueprintLoaded ? blueprintNodeIdSet.has(n.id) : true
+      const structureBound = fromBlueprint
+      const choicesLocked = fromBlueprint
+      const placements = n.visuals?.placements || []
+      const activePlacement = placements.find((p) => p.id === activePlacementId) || null
+
+      const setNode = (updater: (node: NodeV1) => NodeV1) => {
+        setDocStory((s) => ({
+          ...s,
+          nodes: s.nodes.map((x) => (x.id === n.id ? ensureNode(updater(ensureNode(x))) : x))
+        }))
+      }
+
+      const allNodes = nodes
+
+      return (
+        <div className="section">
+          <div className="right-acc">
+            <div className="fold">
+            <div className="fold-head" onClick={() => toggleRightFold('nodeProps')}>
+                <div className="fold-title">{n.kind === 'scene' ? '场景节点属性' : '结局节点属性'}</div>
+                <div className="fold-actions" onClick={(e) => e.stopPropagation()}>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title={rightFold.nodeProps ? '折叠' : '展开'}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      toggleRightFold('nodeProps')
+                    }}
+                  >
+                    {rightFold.nodeProps ? '－' : '＋'}
+                  </button>
+                </div>
+              </div>
+
+	              {rightFold.nodeProps ? (
+	                <div className="fold-body">
+	                  <div className="form" style={{ marginTop: 8 }}>
+	                    <div className="form-row">
+	                      <label>{n.kind === 'scene' ? '场景名称（必填）' : '结局名称（必填）'}</label>
+	                      <input
+	                        className="input"
+	                        value={n.name}
+	                        onChange={(e) => {
+	                          const name = e.target.value
+	                          if (!String(name).trim()) return
+	                          setNode((x) => {
+	                            const nn = ensureNode(x)
+	                            const steps = Array.isArray(nn.timeline?.steps) ? nn.timeline.steps : []
+	                            if (nn.kind === 'ending' && steps.length === 1) {
+	                              const s0 = steps[0]
+	                              const acts = Array.isArray(s0.actions) ? s0.actions : []
+	                              const idx = acts.findIndex((a: any) => String(a && a.type) === 'ui.showEndingCard')
+	                              if (idx >= 0) {
+	                                const card = (acts[idx] as any).card || {}
+	                                const nextActs = acts.slice()
+	                                nextActs[idx] = { ...(acts[idx] as any), card: { ...card, title: name || card.title } }
+	                                return { ...nn, name, timeline: { steps: [{ ...s0, actions: nextActs }] } }
+	                              }
+	                            }
+	                            return { ...nn, name }
+	                          })
+	                        }}
+	                      />
+	                    </div>
+	                    <div className="hint" style={{ marginTop: 6 }}>
+	                      来源：{fromBlueprint ? '蓝图结构' : '合成层临时节点'}。{fromBlueprint ? '结构调整请返回蓝图层。' : '可在合成层直接删除。'}
+	                    </div>
+	                    {structureBound ? <div className="hint" style={{ marginTop: 6, color: '#fde68a' }}>合成层用于文案与演出排练；结构（节点/跳转）请回到蓝图层调整。</div> : null}
+	                  </div>
+
+	                  <div className="hr" />
+
+	                  <div className="sub-acc">
+	                    <div className="subfold subfold-content">
+	                      <div className="subfold-head" onClick={() => toggleRightFold('nodeContent')}>
+	                        <div className="subfold-title">对话内容</div>
+	                        <div className="fold-actions" onClick={(e) => e.stopPropagation()}>
+	                          <button
+	                            type="button"
+	                            className="icon-btn"
+	                            title={rightFold.nodeContent ? '折叠' : '展开'}
+	                            onClick={(e) => {
+	                              e.stopPropagation()
+	                              toggleRightFold('nodeContent')
+	                            }}
+	                          >
+	                            {rightFold.nodeContent ? '－' : '＋'}
+	                          </button>
+	                        </div>
+	                      </div>
+
+	                      {rightFold.nodeContent ? (
+	                        <div className="subfold-body">
+	                          <div className="form">
+	                            <div className="form-row">
+	                              <label>对话标题（可空）</label>
+	                              <input
+	                                className="input"
+	                                value={String((n as any).body?.title || '')}
+	                                onChange={(e) => {
+	                                  const title = e.target.value
+	                                  setNode((x) => {
+	                                    const nn = ensureNode(x)
+	                                    const bodyIn = (nn as any).body && typeof (nn as any).body === 'object' ? (nn as any).body : { text: '' }
+	                                    const nextBody = { ...bodyIn, title }
+	                                    if (!String(title || '').trim()) {
+	                                      try {
+	                                        delete (nextBody as any).title
+	                                      } catch {}
+	                                    }
+	                                    return { ...nn, body: nextBody }
+	                                  })
+	                                }}
+	                              />
+	                            </div>
+
+	                            <div className="form-row">
+	                              <label>类型</label>
+	                              <select
+	                                className="sel"
+	                                value={n.kind}
+	                                disabled={structureBound}
+	                                onChange={(e) => {
+	                                  const kind = e.target.value === 'ending' ? 'ending' : 'scene'
+	                                  setNode((x) => ({
+	                                    ...x,
+	                                    kind,
+	                                    timeline: undefined,
+	                                    choices: kind === 'scene' ? (Array.isArray(x.choices) ? x.choices : []) : undefined
+	                                  }))
+	                                }}
+	                              >
+	                                <option value="scene">场景</option>
+	                                <option value="ending">结局</option>
+	                              </select>
+	                            </div>
+
+	                            <div className="form-row">
+	                              <label>文本</label>
+	                              <textarea
+	                                className="textarea"
+	                                value={String(n.body?.text || '')}
+	                                onChange={(e) => {
+	                                  const text = e.target.value
+	                                  setNode((x) => {
+	                                    const nn = ensureNode(x)
+	                                    const steps = Array.isArray(nn.timeline?.steps) ? nn.timeline.steps : []
+	                                    if (steps.length === 1) {
+	                                      const s0 = steps[0]
+	                                      const acts = Array.isArray(s0.actions) ? s0.actions : []
+	                                      if (nn.kind === 'scene') {
+	                                        const idx = acts.findIndex((a: any) => String(a && a.type) === 'ui.setText')
+	                                        if (idx >= 0 && acts.length === 1) {
+	                                          const nextActs = acts.slice()
+	                                          nextActs[idx] = { ...(acts[idx] as any), text }
+	                                          return { ...nn, body: { text }, timeline: { steps: [{ ...s0, actions: nextActs }] } }
+	                                        }
+	                                      } else if (nn.kind === 'ending') {
+	                                        const idx = acts.findIndex((a: any) => String(a && a.type) === 'ui.showEndingCard')
+	                                        if (idx >= 0) {
+	                                          const card = (acts[idx] as any).card || {}
+	                                          const nextActs = acts.slice()
+	                                          nextActs[idx] = { ...(acts[idx] as any), card: { ...card, moral: text || card.moral } }
+	                                          return { ...nn, body: { text }, timeline: { steps: [{ ...s0, actions: nextActs }] } }
+	                                        }
+	                                      }
+	                                    }
+	                                    return { ...nn, body: { text } }
+	                                  })
+	                                  if (effectivePreviewNode?.id === n.id && rt.stepIndex === 0) {
+	                                    setRt((prev) => ({ ...prev, text }))
+	                                  }
+	                                }}
+	                              />
+	                            </div>
+	                          </div>
+	                        </div>
+	                      ) : null}
+	                    </div>
+
+	                    <div className="subfold subfold-stage">
+	                      <div className="subfold-head" onClick={() => toggleRightFold('background')}>
+	                        <div className="subfold-title">尺寸与背景</div>
+	                        <div className="fold-actions" onClick={(e) => e.stopPropagation()}>
+	                          <button
+	                            type="button"
+	                            className="icon-btn"
+	                            title={rightFold.background ? '折叠' : '展开'}
+	                            onClick={(e) => {
+	                              e.stopPropagation()
+	                              toggleRightFold('background')
+	                            }}
+	                          >
+	                            {rightFold.background ? '－' : '＋'}
+	                          </button>
+	                        </div>
+	                      </div>
+
+	                      {rightFold.background ? (
+	                        <div className="subfold-body">
+	                          {(() => {
+	                            const stage = normalizeStageV1((doc.project as any).stage)
+	                            const presets = [
+	                              { key: 'p720x1280', label: '竖屏 720×1280（9:16）', orientation: 'portrait' as const, w: 720, h: 1280 },
+	                              { key: 'p1080x1920', label: '竖屏 1080×1920（9:16）', orientation: 'portrait' as const, w: 1080, h: 1920 },
+	                              { key: 'p750x1334', label: '竖屏 750×1334（iPhone）', orientation: 'portrait' as const, w: 750, h: 1334 },
+	                              { key: 'l1280x720', label: '横屏 1280×720（16:9）', orientation: 'landscape' as const, w: 1280, h: 720 },
+	                              { key: 'l1920x1080', label: '横屏 1920×1080（16:9）', orientation: 'landscape' as const, w: 1920, h: 1080 },
+	                              { key: 'l1024x768', label: '横屏 1024×768（4:3）', orientation: 'landscape' as const, w: 1024, h: 768 }
+	                            ]
+	                            const presetKey =
+	                              presets.find((p) => p.w === stage.width && p.h === stage.height && p.orientation === stage.orientation)?.key || ''
+
+	                            const setStage = (patch: Partial<StageConfigV1>) => {
+	                              setDocProject((p) => ({ ...p, stage: normalizeStageV1({ ...(p as any).stage, ...patch }) }))
+	                            }
+
+	                            return (
+	                              <div className="form" style={{ gap: 10 }}>
+	                                <div>
+	                                  <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>设计尺寸（全局）</div>
+	                                  <div className="hint" style={{ marginTop: 6 }}>
+	                                    影响编辑器预览与导出成品。推荐先选常用尺寸，再微调。
+	                                  </div>
+	                                </div>
+
+	                                <div className="form-row">
+	                                  <label>方向</label>
+	                                  <select
+	                                    className="sel"
+	                                    value={stage.orientation || (stage.width >= stage.height ? 'landscape' : 'portrait')}
+	                                    onChange={(e) =>
+	                                      setStage({ orientation: e.target.value === 'landscape' ? 'landscape' : 'portrait' })
+	                                    }
+	                                    disabled={busy}
+	                                  >
+	                                    <option value="portrait">竖屏</option>
+	                                    <option value="landscape">横屏</option>
+	                                  </select>
+	                                </div>
+
+	                                <div className="form-row">
+	                                  <label>常用尺寸</label>
+	                                  <select
+	                                    className="sel"
+	                                    value={presetKey}
+	                                    onChange={(e) => {
+	                                      const p = presets.find((x) => x.key === e.target.value)
+	                                      if (!p) return
+	                                      setStage({ orientation: p.orientation, width: p.w, height: p.h })
+	                                    }}
+	                                    disabled={busy}
+	                                  >
+	                                    <option value="">自定义</option>
+	                                    {presets.map((p) => (
+	                                      <option key={p.key} value={p.key}>
+	                                        {p.label}
+	                                      </option>
+	                                    ))}
+	                                  </select>
+	                                </div>
+
+	                                <div className="form-row">
+	                                  <label>宽 × 高</label>
+	                                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+	                                    <input
+	                                      className="input"
+	                                      type="number"
+	                                      min={320}
+	                                      max={4096}
+	                                      value={String(stage.width)}
+	                                      onChange={(e) => setStage({ width: Number(e.target.value) })}
+	                                      disabled={busy}
+	                                      style={{ width: 110 }}
+	                                    />
+	                                    <span style={{ opacity: 0.7 }}>×</span>
+	                                    <input
+	                                      className="input"
+	                                      type="number"
+	                                      min={320}
+	                                      max={4096}
+	                                      value={String(stage.height)}
+	                                      onChange={(e) => setStage({ height: Number(e.target.value) })}
+	                                      disabled={busy}
+	                                      style={{ width: 110 }}
+	                                    />
+	                                  </div>
+	                                </div>
+
+	                                <div className="form-row">
+	                                  <label>适配</label>
+	                                  <select
+	                                    className="sel"
+	                                    value={stage.scaleMode || 'contain'}
+	                                    onChange={(e) => setStage({ scaleMode: e.target.value === 'cover' ? 'cover' : 'contain' })}
+	                                    disabled={busy}
+	                                  >
+	                                    <option value="contain">完整显示（留黑边）</option>
+	                                    <option value="cover">裁切填满（可能裁剪）</option>
+	                                  </select>
+	                                </div>
+	                              </div>
+	                            )
+	                          })()}
+
+	                          <div className="hr" />
+
+	                          {(() => {
+	                            const bgId = String(n.visuals?.backgroundAssetId || '')
+	                            const bgAsset = bgId ? doc.project.assets.find((a) => a.id === bgId) || null : null
+	                            const hasImage = !!(bgAsset && String(bgAsset.uri || '').trim())
+
+		                            const createBackgroundAsset = () => {
+		                              const id = uid('asset')
+		                              const asset: AssetV1 = {
+		                                id,
+		                                kind: 'image',
+		                                name: `背景图 ${new Date().toLocaleTimeString()}`,
+		                                uri: '',
+		                                source: { type: 'upload' as const }
+		                              }
+		                              setDocProject((p) => ({ ...p, assets: [...(p.assets || []), asset] }))
+		                              setNode((x) => ({ ...x, visuals: { ...ensureNode(x).visuals, backgroundAssetId: id } }))
+		                              return id
+		                            }
+
+	                            const bgUsed = new Set(
+	                              (doc.story?.nodes || [])
+	                                .map((x) => String(ensureNode(x).visuals?.backgroundAssetId || '').trim())
+	                                .filter(Boolean)
+	                            )
+	                            const bgAssets = doc.project.assets.filter(
+	                              (a) =>
+	                                a.kind === 'image' && (bgUsed.has(a.id) || /^背景/.test(String(a.name || '')) || a.source?.type === 'ai')
+	                            )
+	                            const bgAssetsWithSelected = bgId && bgAsset && !bgAssets.some((a) => a.id === bgId) ? [...bgAssets, bgAsset] : bgAssets
+
+	                            return (
+	                              <>
+	                                <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>背景</div>
+
+	                                <div className="form-row" style={{ marginTop: 8 }}>
+	                                  <label>背景资源</label>
+	                                  <select
+	                                    className="sel"
+	                                    value={bgId}
+	                                    onChange={(e) => {
+	                                      const v = e.target.value || undefined
+	                                      setNode((x) => ({ ...x, visuals: { ...ensureNode(x).visuals, backgroundAssetId: v } }))
+	                                    }}
+	                                  >
+	                                    <option value="">（无）</option>
+	                                    {doc.project.assets.map((a) => (
+	                                      <option key={a.id} value={a.id}>
+	                                        {a.name || a.id}
+	                                      </option>
+	                                    ))}
+	                                  </select>
+	                                </div>
+
+		                                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+			                                  <button
+			                                    className="btn secondary"
+				                                    onClick={() => {
+				                                      const st = (doc && doc.mode === 'project' && doc.project && (doc.project as any).state && typeof (doc.project as any).state === 'object') ? (doc.project as any).state : {}
+				                                      const aiBg = st && (st as any).aiBackground && typeof (st as any).aiBackground === 'object' ? (st as any).aiBackground : {}
+				                                      const gpRaw = aiBg && typeof (aiBg as any).globalPrompt === 'string' ? String((aiBg as any).globalPrompt) : ''
+				                                      const gneg = aiBg && typeof (aiBg as any).globalNegativePrompt === 'string' ? String((aiBg as any).globalNegativePrompt) : ''
+				                                      const projectTitle = (doc && doc.mode === 'project' && doc.project) ? String((doc.project as any).title || '').trim() : ''
+				                                      const gp = gpRaw.trim() ? gpRaw : (projectTitle ? `故事名：《${projectTitle}》` : '')
+				                                      setAiReq((v) => ({
+				                                        ...v,
+				                                        globalPrompt: gp,
+				                                        globalNegativePrompt: gneg
+				                                      }))
+			                                      setAiLast(null)
+			                                      setAiError('')
+			                                      setAiOpen(true)
+			                                    }}
+			                                    disabled={busy}
+			                                  >
+		                                    AI 生成背景…
+		                                  </button>
+
+		                                  <button
+		                                    className="btn secondary"
+		                                    onClick={() => {
+		                                      if (doc.mode !== 'project') return
+		                                      const url = resolveUrl(`/api/projects/${encodeURIComponent(String(doc.id))}/assets/ai`)
+		                                      window.open(url, '_blank', 'noopener,noreferrer')
+		                                    }}
+		                                    disabled={busy || doc.mode !== 'project'}
+		                                    title="打开 AI 背景输出目录（便于确认生成位置）"
+		                                  >
+		                                    打开生成目录
+		                                  </button>
+
+		                                  <button
+		                                    className="btn secondary"
+		                                    onClick={() => {
+		                                      const targetId = bgId || createBackgroundAsset()
+		                                      pendingBgAssetIdRef.current = targetId
+		                                      bgFileRef.current?.click()
+		                                    }}
+		                                    disabled={busy || doc.readonly}
+		                                    title="从本地选择图片并上传到项目 assets"
+		                                  >
+		                                    {bgId ? (hasImage ? '替换本地图片…' : '添加本地图片…') : '添加背景图片…'}
+		                                  </button>
+
+		                                  {bgId ? (
+		                                    <>
+		                                      <button
+		                                        className="btn secondary"
+		                                        onClick={() => {
+	                                          if (!bgId) return
+	                                          setDocProject((p) => ({
+	                                            ...p,
+	                                            assets: (p.assets || []).map((a) =>
+	                                              a.id === bgId ? { ...a, uri: '', source: a.source } : a
+	                                            )
+	                                          }))
+	                                          setToast('已删除背景图片')
+	                                        }}
+	                                        disabled={busy || !hasImage}
+	                                        title={hasImage ? '清空该背景资源的图片 URI（保留资源条目）' : '当前背景资源未绑定图片'}
+		                                      >
+		                                        删除图片
+		                                      </button>
+		                                    </>
+		                                  ) : null}
+		                                </div>
+
+	                                {bgId ? (
+	                                  <div className="hint" style={{ marginTop: 8 }}>
+	                                    当前背景资源：{bgAsset?.name || bgId}
+	                                    {hasImage ? '' : '（未绑定图片）'}
+	                                  </div>
+	                                ) : (
+		                                  <div className="hint" style={{ marginTop: 8 }}>
+		                                    未选择背景资源：可先从下拉选择已有资源，或点击“添加背景图片…”创建并绑定。
+		                                  </div>
+		                                )}
+		                              </>
+		                            )
+		                          })()}
+	                          <input
+	                            ref={bgFileRef}
+	                            type="file"
+	                            accept="image/png,image/jpeg,image/webp,image/gif"
+	                            style={{ display: 'none' }}
+	                            onChange={(e) => {
+	                              const f = e.target.files && e.target.files[0] ? e.target.files[0] : null
+	                              if (!f) return
+	                              const target = pendingBgAssetIdRef.current ? String(pendingBgAssetIdRef.current) : undefined
+	                              pendingBgAssetIdRef.current = ''
+	                              void handleUploadBackground(f, target)
+	                              try {
+	                                e.currentTarget.value = ''
+	                              } catch {}
+	                            }}
+	                          />
+	                        </div>
+	                      ) : null}
+	                    </div>
+
+		                    <div className="subfold subfold-dialog">
+	                      <div className="subfold-head" onClick={() => toggleRightFold('choices')}>
+	                        <div className="subfold-title">对话与选项</div>
+	                        <div className="fold-actions" onClick={(e) => e.stopPropagation()}>
+	                          <button
+	                            type="button"
+	                            className="icon-btn"
+	                            title={rightFold.choices ? '折叠' : '展开'}
+	                            onClick={(e) => {
+	                              e.stopPropagation()
+	                              toggleRightFold('choices')
+	                            }}
+	                          >
+	                            {rightFold.choices ? '－' : '＋'}
+	                          </button>
+	                        </div>
+	                      </div>
+
+	                      {rightFold.choices ? (
+	                        <div className="subfold-body">
+	                          {n.kind !== 'scene' ? <div className="hint">结局节点使用结局卡，不显示对话与选项。</div> : null}
+	                          {n.kind === 'scene' ? (
+	                            <div className="form" style={{ gap: 10 }}>
+	                              {(() => {
+	                                const ui = ((n.visuals && (n.visuals as any).ui) || {}) as NodeUiV1
+	                                const dialog = (ui.dialog || {}) as DialogLayoutV1
+	                                const choicesUi = (ui.choices || {}) as ChoicesLayoutV1
+	                                const preset = normalizeDialogPreset((dialog as any).preset)
+	                                const x = clamp01(numberOr((dialog as any).x, 0.5))
+	                                const y = clamp01(numberOr((dialog as any).y, 0.88))
+	                                const dir = normalizeChoicesDirection((choicesUi as any).direction)
+	                                const align = normalizeChoicesAlign((choicesUi as any).align)
+
+	                                const setUi = (patch: Partial<NodeUiV1>) => {
+	                                  setNode((node) => {
+	                                    const nn = ensureNode(node)
+	                                    const visuals = nn.visuals || {}
+	                                    const currUi = (visuals.ui || {}) as NodeUiV1
+	                                    return { ...nn, visuals: { ...visuals, ui: { ...currUi, ...patch } } }
+	                                  })
+	                                }
+
+	                                const setDialog = (patch: Partial<DialogLayoutV1>) => {
+	                                  setUi({ dialog: { ...(ui.dialog || { preset: 'bottom' }), ...patch } as DialogLayoutV1 })
+	                                }
+
+	                                const setChoicesLayout = (patch: Partial<ChoicesLayoutV1>) => {
+	                                  setUi({ choices: { ...(ui.choices || { direction: 'row' }), ...patch } as ChoicesLayoutV1 })
+	                                }
+
+	                                return (
+	                                  <>
+	                                    <div>
+	                                      <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>对话框位置（本节点）</div>
+	                                      <div className="hint" style={{ marginTop: 6 }}>
+	                                        选择“自定义坐标”后，可在画布里拖动对话框定位。
+	                                      </div>
+	                                    </div>
+
+	                                    <div className="form-row">
+	                                      <label>预设</label>
+	                                      <select
+	                                        className="sel"
+	                                        value={preset}
+	                                        onChange={(e) => setDialog({ preset: normalizeDialogPreset(e.target.value) })}
+	                                      >
+	                                        <option value="bottom">底部</option>
+	                                        <option value="top">顶部</option>
+	                                        <option value="center">居中</option>
+	                                        <option value="left">左侧</option>
+	                                        <option value="right">右侧</option>
+	                                        <option value="custom">自定义坐标</option>
+	                                      </select>
+	                                    </div>
+
+	                                    {preset === 'custom' ? (
+	                                      <div className="form-row">
+	                                        <label>坐标</label>
+	                                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+	                                          <input
+	                                            className="input"
+	                                            type="number"
+	                                            min={0}
+	                                            max={1}
+	                                            step={0.01}
+	                                            value={String(x)}
+	                                            onChange={(e) => setDialog({ x: clamp01(Number(e.target.value)) })}
+	                                            style={{ width: 110 }}
+	                                          />
+	                                          <span style={{ opacity: 0.7 }}>×</span>
+	                                          <input
+	                                            className="input"
+	                                            type="number"
+	                                            min={0}
+	                                            max={1}
+	                                            step={0.01}
+	                                            value={String(y)}
+	                                            onChange={(e) => setDialog({ y: clamp01(Number(e.target.value)) })}
+	                                            style={{ width: 110 }}
+	                                          />
+	                                        </div>
+	                                      </div>
+	                                    ) : null}
+
+	                                    <div className="hr" />
+
+	                                    <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>选项按钮布局（本节点）</div>
+
+	                                    <div className="form-row">
+	                                      <label>排列</label>
+	                                      <select
+	                                        className="sel"
+	                                        value={dir}
+	                                        onChange={(e) => setChoicesLayout({ direction: normalizeChoicesDirection(e.target.value) })}
+	                                      >
+	                                        <option value="row">横向（自动换行）</option>
+	                                        <option value="column">竖向</option>
+	                                      </select>
+	                                    </div>
+
+	                                    <div className="form-row">
+	                                      <label>对齐</label>
+	                                      <select
+	                                        className="sel"
+	                                        value={align}
+	                                        onChange={(e) => setChoicesLayout({ align: normalizeChoicesAlign(e.target.value) })}
+	                                      >
+	                                        <option value="start">靠左</option>
+	                                        <option value="center">居中</option>
+	                                        <option value="end">靠右</option>
+	                                        <option value="stretch">拉伸</option>
+	                                      </select>
+	                                    </div>
+
+	                                    <div className="hr" />
+	                                  </>
+	                                )
+	                              })()}
+
+	                              {(Array.isArray(n.choices) ? n.choices : []).map((c) => (
+	                                <div key={c.id} style={{ border: '1px solid rgba(148,163,184,0.16)', borderRadius: 12, padding: 10 }}>
+	                                  <div className="form-row">
+	                                    <label>按钮文本</label>
+	                                    <input
+	                                      className="input"
+	                                      value={c.text}
+	                                      disabled={choicesLocked}
+	                                      onChange={(e) =>
+	                                        choicesLocked ? null :
+	                                        setNode((x) => ({
+	                                          ...x,
+	                                          choices: (Array.isArray(x.choices) ? x.choices : []).map((cc) =>
+	                                            cc.id === c.id ? { ...cc, text: e.target.value } : cc
+	                                          )
+	                                        }))
+	                                      }
+	                                    />
+	                                  </div>
+	                                  <div className="form-row">
+	                                    <label>跳转到</label>
+	                                    <select
+	                                      className="sel"
+	                                      value={c.toNodeId}
+	                                      disabled={choicesLocked}
+	                                      onChange={(e) =>
+	                                        choicesLocked ? null :
+	                                        setNode((x) => ({
+	                                          ...x,
+	                                          choices: (Array.isArray(x.choices) ? x.choices : []).map((cc) =>
+	                                            cc.id === c.id ? { ...cc, toNodeId: e.target.value } : cc
+	                                          )
+	                                        }))
+	                                      }
+	                                    >
+	                                      {allNodes.map((nn) => (
+	                                        <option key={nn.id} value={nn.id}>
+	                                          {nn.name || nn.id}
+	                                        </option>
+	                                      ))}
+	                                    </select>
+	                                  </div>
+	                                  {!choicesLocked ? <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+	                                    <button
+	                                      className="btn secondary"
+	                                      onClick={() =>
+	                                        setNode((x) => ({
+	                                          ...x,
+	                                          choices: (Array.isArray(x.choices) ? x.choices : []).filter((cc) => cc.id !== c.id)
+	                                        }))
+	                                      }
+	                                    >
+	                                      删除选项
+	                                    </button>
+	                                  </div> : null}
+	                                </div>
+	                              ))}
+
+	                              {!choicesLocked ? <button
+	                                className="btn secondary"
+	                                onClick={() => {
+	                                  const toNodeId = doc.story?.startNodeId || nodes[0]?.id || ''
+	                                  const next: ChoiceV1 = { id: uid('choice'), text: '继续', toNodeId }
+	                                  setNode((x) => ({ ...x, choices: [...(Array.isArray(x.choices) ? x.choices : []), next] }))
+	                                }}
+	                              >
+	                                + 添加选项
+	                              </button> : null}
+	                            </div>
+	                          ) : null}
+	                        </div>
+	                      ) : null}
+	                    </div>
+	                  </div>
+	                </div>
+	              ) : null}
+	            </div>
+
+	            {/*
+	            <div className="fold">
+	              <div className="fold-head" onClick={() => toggleRightFold('background')}>
+	                <div className="fold-title">尺寸与背景</div>
+	                <div className="fold-actions" onClick={(e) => e.stopPropagation()}>
+	                  <button
+	                    type="button"
+	                    className="icon-btn"
+	                    title={rightFold.background ? '折叠' : '展开'}
+	                    onClick={(e) => {
+	                      e.stopPropagation()
+	                      toggleRightFold('background')
+	                    }}
+	                  >
+	                    {rightFold.background ? '－' : '＋'}
+	                  </button>
+	                </div>
+	              </div>
+
+	              {rightFold.background ? (
+	                <div className="fold-body">
+	                  {(() => {
+	                    const stage = normalizeStageV1((doc.project as any).stage)
+	                    const presets = [
+	                      { key: 'p720x1280', label: '竖屏 720×1280（9:16）', orientation: 'portrait' as const, w: 720, h: 1280 },
+	                      { key: 'p1080x1920', label: '竖屏 1080×1920（9:16）', orientation: 'portrait' as const, w: 1080, h: 1920 },
+	                      { key: 'p750x1334', label: '竖屏 750×1334（iPhone）', orientation: 'portrait' as const, w: 750, h: 1334 },
+	                      { key: 'l1280x720', label: '横屏 1280×720（16:9）', orientation: 'landscape' as const, w: 1280, h: 720 },
+	                      { key: 'l1920x1080', label: '横屏 1920×1080（16:9）', orientation: 'landscape' as const, w: 1920, h: 1080 },
+	                      { key: 'l1024x768', label: '横屏 1024×768（4:3）', orientation: 'landscape' as const, w: 1024, h: 768 }
+	                    ]
+	                    const presetKey =
+	                      presets.find((p) => p.w === stage.width && p.h === stage.height && p.orientation === stage.orientation)?.key || ''
+
+	                    const setStage = (patch: Partial<StageConfigV1>) => {
+	                      setDocProject((p) => ({ ...p, stage: normalizeStageV1({ ...(p as any).stage, ...patch }) }))
+	                    }
+
+	                    return (
+	                      <div className="form" style={{ gap: 10 }}>
+	                        <div>
+	                          <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>设计尺寸（全局）</div>
+	                          <div className="hint" style={{ marginTop: 6 }}>
+	                            影响编辑器预览与导出成品。推荐先选常用尺寸，再微调。
+	                          </div>
+	                        </div>
+
+	                        <div className="form-row">
+	                          <label>方向</label>
+	                          <select
+	                            className="sel"
+	                            value={stage.orientation || (stage.width >= stage.height ? 'landscape' : 'portrait')}
+	                            onChange={(e) => setStage({ orientation: e.target.value === 'landscape' ? 'landscape' : 'portrait' })}
+	                            disabled={busy}
+	                          >
+	                            <option value="portrait">竖屏</option>
+	                            <option value="landscape">横屏</option>
+	                          </select>
+	                        </div>
+
+	                        <div className="form-row">
+	                          <label>常用尺寸</label>
+	                          <select
+	                            className="sel"
+	                            value={presetKey}
+	                            onChange={(e) => {
+	                              const p = presets.find((x) => x.key === e.target.value)
+	                              if (!p) return
+	                              setStage({ orientation: p.orientation, width: p.w, height: p.h })
+	                            }}
+	                            disabled={busy}
+	                          >
+	                            <option value="">自定义</option>
+	                            {presets.map((p) => (
+	                              <option key={p.key} value={p.key}>
+	                                {p.label}
+	                              </option>
+	                            ))}
+	                          </select>
+	                        </div>
+
+	                        <div className="form-row">
+	                          <label>宽 × 高</label>
+	                          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+	                            <input
+	                              className="input"
+	                              type="number"
+	                              min={320}
+	                              max={4096}
+	                              value={String(stage.width)}
+	                              onChange={(e) => setStage({ width: Number(e.target.value) })}
+	                              disabled={busy}
+	                              style={{ width: 110 }}
+	                            />
+	                            <span style={{ opacity: 0.7 }}>×</span>
+	                            <input
+	                              className="input"
+	                              type="number"
+	                              min={320}
+	                              max={4096}
+	                              value={String(stage.height)}
+	                              onChange={(e) => setStage({ height: Number(e.target.value) })}
+	                              disabled={busy}
+	                              style={{ width: 110 }}
+	                            />
+	                          </div>
+	                        </div>
+
+	                        <div className="form-row">
+	                          <label>适配</label>
+	                          <select
+	                            className="sel"
+	                            value={stage.scaleMode || 'contain'}
+	                            onChange={(e) => setStage({ scaleMode: e.target.value === 'cover' ? 'cover' : 'contain' })}
+	                            disabled={busy}
+	                          >
+	                            <option value="contain">完整显示（留黑边）</option>
+	                            <option value="cover">裁切填满（可能裁剪）</option>
+	                          </select>
+	                        </div>
+	                      </div>
+	                    )
+	                  })()}
+
+	                  <div className="hr" />
+
+	                  {(() => {
+	                    const bgId = String(n.visuals?.backgroundAssetId || '')
+	                    const bgAsset = bgId ? doc.project.assets.find((a) => a.id === bgId) || null : null
+	                    const hasImage = !!(bgAsset && String(bgAsset.uri || '').trim())
+
+	                    const createBackgroundAsset = () => {
+	                      const id = uid('asset')
+	                      const asset: AssetV1 = {
+	                        id,
+	                        kind: 'image',
+	                        name: `背景图 ${new Date().toLocaleTimeString()}`,
+	                        uri: '',
+	                        source: { type: 'upload' as const }
+	                      }
+	                      setDocProject((p) => ({ ...p, assets: [...(p.assets || []), asset] }))
+	                      setNode((x) => ({ ...x, visuals: { ...ensureNode(x).visuals, backgroundAssetId: id } }))
+	                      return id
+	                    }
+
+	                    const bgUsed = new Set(
+	                      (doc.story?.nodes || [])
+	                        .map((x) => String(ensureNode(x).visuals?.backgroundAssetId || '').trim())
+	                        .filter(Boolean)
+	                    )
+	                    const bgAssets = doc.project.assets.filter(
+	                      (a) => a.kind === 'image' && (bgUsed.has(a.id) || /^背景/.test(String(a.name || '')) || a.source?.type === 'ai')
+	                    )
+	                    const bgAssetsWithSelected = bgId && bgAsset && !bgAssets.some((a) => a.id === bgId) ? [...bgAssets, bgAsset] : bgAssets
+
+	                    return (
+	                      <>
+	                        <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>背景</div>
+
+	                        <div className="form-row" style={{ marginTop: 8 }}>
+	                          <label>背景资源</label>
+	                          <select
+	                            className="sel"
+	                            value={bgId}
+	                            onChange={(e) => {
+	                              const v = e.target.value || undefined
+	                              setNode((x) => ({ ...x, visuals: { ...ensureNode(x).visuals, backgroundAssetId: v } }))
+	                            }}
+	                          >
+	                            <option value="">（无）</option>
+	                            {doc.project.assets.map((a) => (
+	                              <option key={a.id} value={a.id}>
+	                                {a.name || a.id}
+	                              </option>
+	                            ))}
+	                          </select>
+	                        </div>
+
+	                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+	                          <button
+	                            className="btn secondary"
+		                            onClick={() => {
+		                              const st = (doc && doc.mode === 'project' && doc.project && (doc.project as any).state && typeof (doc.project as any).state === 'object') ? (doc.project as any).state : {}
+		                              const aiBg = st && (st as any).aiBackground && typeof (st as any).aiBackground === 'object' ? (st as any).aiBackground : {}
+		                              const gpRaw = aiBg && typeof (aiBg as any).globalPrompt === 'string' ? String((aiBg as any).globalPrompt) : ''
+		                              const gneg = aiBg && typeof (aiBg as any).globalNegativePrompt === 'string' ? String((aiBg as any).globalNegativePrompt) : ''
+		                              const projectTitle = (doc && doc.mode === 'project' && doc.project) ? String((doc.project as any).title || '').trim() : ''
+		                              const gp = gpRaw.trim() ? gpRaw : (projectTitle ? `故事名：《${projectTitle}》` : '')
+		                              setAiReq((v) => ({ ...v, globalPrompt: gp, globalNegativePrompt: gneg }))
+		                              setAiError('')
+		                              setAiOpen(true)
+		                            }}
+	                            disabled={busy}
+	                          >
+	                            AI 生成背景…
+	                          </button>
+
+	                          <button
+	                            className="btn secondary"
+	                            onClick={() => {
+	                              const targetId = bgId || createBackgroundAsset()
+	                              pendingBgAssetIdRef.current = targetId
+	                              bgFileRef.current?.click()
+	                            }}
+	                            disabled={busy || doc.readonly}
+	                            title="从本地选择图片并上传到项目 assets"
+	                          >
+	                            {bgId ? (hasImage ? '替换本地图片…' : '添加本地图片…') : '添加背景图片…'}
+	                          </button>
+
+	                          {bgId ? (
+	                            <>
+	                              <button
+	                                className="btn secondary"
+	                                onClick={() => {
+	                                  if (!bgId) return
+	                                  setDocProject((p) => ({
+	                                    ...p,
+	                                    assets: (p.assets || []).map((a) => (a.id === bgId ? { ...a, uri: '', source: a.source } : a))
+	                                  }))
+	                                  setToast('已删除背景图片')
+	                                }}
+	                                disabled={busy || !hasImage}
+	                                title={hasImage ? '清空该背景资源的图片 URI（保留资源条目）' : '当前背景资源未绑定图片'}
+	                              >
+	                                删除图片
+	                              </button>
+
+	                              <button
+	                                className="btn secondary"
+	                                onClick={() => deleteAsset(bgId)}
+	                                disabled={busy}
+	                                title="删除该背景资源（会从列表中移除，并清空所有引用）"
+	                              >
+	                                删除资源
+	                              </button>
+
+	                              <button
+	                                className="btn secondary"
+	                                onClick={() =>
+	                                  setNode((x) => ({ ...x, visuals: { ...ensureNode(x).visuals, backgroundAssetId: undefined } }))
+	                                }
+	                                disabled={busy}
+	                                title="仅取消当前节点对该背景资源的关联（不删除资源）"
+	                              >
+	                                取消关联
+	                              </button>
+	                            </>
+	                          ) : null}
+	                        </div>
+
+	                        {bgId ? (
+	                          <div className="hint" style={{ marginTop: 8 }}>
+	                            当前背景资源：{bgAsset?.name || bgId}
+	                            {hasImage ? '' : '（未绑定图片）'}
+	                          </div>
+	                        ) : (
+	                          <div className="hint" style={{ marginTop: 8 }}>
+	                            未选择背景资源：可先从下拉选择已有资源，或点击“添加背景图片…”创建并绑定。
+	                          </div>
+	                        )}
+
+	                        <div className="hr" />
+
+	                        <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>背景图片列表</div>
+	                        <div className="hint" style={{ marginTop: 6 }}>
+	                          删除资源会清空引用并从列表移除。
+	                        </div>
+	                        <div className="mini-scroll" style={{ marginTop: 8, maxHeight: 160, display: 'flex', flexDirection: 'column', gap: 6 }}>
+	                          {bgAssetsWithSelected.length ? (
+	                            bgAssetsWithSelected.map((a) => {
+	                              const selected = bgId && a.id === bgId
+	                              return (
+	                                <div
+	                                  key={a.id}
+	                                  style={{
+	                                    display: 'flex',
+	                                    gap: 8,
+	                                    alignItems: 'center',
+	                                    justifyContent: 'space-between',
+	                                    border: '1px solid rgba(148,163,184,0.14)',
+	                                    borderRadius: 10,
+	                                    padding: '6px 8px',
+	                                    background: selected ? 'rgba(37,99,235,0.10)' : 'rgba(2,6,23,0.20)'
+	                                  }}
+	                                >
+	                                  <div style={{ minWidth: 0 }}>
+	                                    <div style={{ fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+	                                      {a.name || a.id}
+	                                    </div>
+	                                    <div style={{ fontSize: 11, opacity: 0.7 }}>{String(a.uri || '').trim() ? '已绑定图片' : '未绑定图片'}</div>
+	                                  </div>
+	                                  <button className="icon-btn" title="删除该背景资源" onClick={() => deleteAsset(a.id)} disabled={busy}>
+	                                    ✕
+	                                  </button>
+	                                </div>
+	                              )
+	                            })
+	                          ) : (
+	                            <div className="hint">暂无背景图片资源。</div>
+	                          )}
+	                        </div>
+	                      </>
+	                    )
+	                  })()}
+	                  <input
+	                    ref={bgFileRef}
+	                    type="file"
+	                    accept="image/png,image/jpeg,image/webp,image/gif"
+	                    style={{ display: 'none' }}
+	                    onChange={(e) => {
+	                      const f = e.target.files && e.target.files[0] ? e.target.files[0] : null
+	                      if (!f) return
+	                      const target = pendingBgAssetIdRef.current ? String(pendingBgAssetIdRef.current) : undefined
+	                      pendingBgAssetIdRef.current = ''
+	                      void handleUploadBackground(f, target)
+	                      try {
+	                        e.currentTarget.value = ''
+	                      } catch {}
+	                    }}
+	                  />
+	                </div>
+	              ) : null}
+	            </div>
+
+	            <div className="fold">
+	              <div className="fold-head" onClick={() => toggleRightFold('choices')}>
+	                <div className="fold-title">对话与选项</div>
+	                <div className="fold-actions" onClick={(e) => e.stopPropagation()}>
+	                  <button
+	                    type="button"
+	                    className="icon-btn"
+	                    title={rightFold.choices ? '折叠' : '展开'}
+	                    onClick={(e) => {
+	                      e.stopPropagation()
+	                      toggleRightFold('choices')
+	                    }}
+	                  >
+	                    {rightFold.choices ? '－' : '＋'}
+	                  </button>
+	                </div>
+	              </div>
+
+	              {rightFold.choices ? (
+	                <div className="fold-body">
+	                  {n.kind !== 'scene' ? <div className="hint">结局节点不包含对话与选项。</div> : null}
+	                  {n.kind === 'scene' ? (
+	                    <div className="form" style={{ gap: 10 }}>
+	                      {(() => {
+	                        const ui = ((n.visuals && (n.visuals as any).ui) || {}) as NodeUiV1
+	                        const dialog = (ui.dialog || {}) as DialogLayoutV1
+	                        const choicesUi = (ui.choices || {}) as ChoicesLayoutV1
+	                        const preset = normalizeDialogPreset((dialog as any).preset)
+	                        const x = clamp01(numberOr((dialog as any).x, 0.5))
+	                        const y = clamp01(numberOr((dialog as any).y, 0.88))
+	                        const dir = normalizeChoicesDirection((choicesUi as any).direction)
+	                        const align = normalizeChoicesAlign((choicesUi as any).align)
+
+	                        const setUi = (patch: Partial<NodeUiV1>) => {
+	                          setNode((node) => {
+	                            const nn = ensureNode(node)
+	                            const visuals = nn.visuals || {}
+	                            const currUi = (visuals.ui || {}) as NodeUiV1
+	                            return { ...nn, visuals: { ...visuals, ui: { ...currUi, ...patch } } }
+	                          })
+	                        }
+
+	                        const setDialog = (patch: Partial<DialogLayoutV1>) => {
+	                          setUi({ dialog: { ...(ui.dialog || { preset: 'bottom' }), ...patch } as DialogLayoutV1 })
+	                        }
+
+	                        const setChoicesLayout = (patch: Partial<ChoicesLayoutV1>) => {
+	                          setUi({ choices: { ...(ui.choices || { direction: 'row' }), ...patch } as ChoicesLayoutV1 })
+	                        }
+
+	                        return (
+	                          <>
+	                            <div>
+	                              <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>对话框位置（本节点）</div>
+	                              <div className="hint" style={{ marginTop: 6 }}>
+	                                选择“自定义坐标”后，可在画布里拖动对话框定位。
+	                              </div>
+	                            </div>
+
+	                            <div className="form-row">
+	                              <label>预设</label>
+	                              <select className="sel" value={preset} onChange={(e) => setDialog({ preset: normalizeDialogPreset(e.target.value) })}>
+	                                <option value="bottom">底部</option>
+	                                <option value="top">顶部</option>
+	                                <option value="center">居中</option>
+	                                <option value="left">左侧</option>
+	                                <option value="right">右侧</option>
+	                                <option value="custom">自定义坐标</option>
+	                              </select>
+	                            </div>
+
+	                            {preset === 'custom' ? (
+	                              <div className="form-row">
+	                                <label>坐标</label>
+	                                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+	                                  <input
+	                                    className="input"
+	                                    type="number"
+	                                    min={0}
+	                                    max={1}
+	                                    step={0.01}
+	                                    value={String(x)}
+	                                    onChange={(e) => setDialog({ x: clamp01(Number(e.target.value)) })}
+	                                    style={{ width: 110 }}
+	                                  />
+	                                  <span style={{ opacity: 0.7 }}>×</span>
+	                                  <input
+	                                    className="input"
+	                                    type="number"
+	                                    min={0}
+	                                    max={1}
+	                                    step={0.01}
+	                                    value={String(y)}
+	                                    onChange={(e) => setDialog({ y: clamp01(Number(e.target.value)) })}
+	                                    style={{ width: 110 }}
+	                                  />
+	                                </div>
+	                              </div>
+	                            ) : null}
+
+	                            <div className="hr" />
+
+	                            <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>选项按钮布局（本节点）</div>
+
+	                            <div className="form-row">
+	                              <label>排列</label>
+	                              <select className="sel" value={dir} onChange={(e) => setChoicesLayout({ direction: normalizeChoicesDirection(e.target.value) })}>
+	                                <option value="row">横向（自动换行）</option>
+	                                <option value="column">竖向</option>
+	                              </select>
+	                            </div>
+
+	                            <div className="form-row">
+	                              <label>对齐</label>
+	                              <select className="sel" value={align} onChange={(e) => setChoicesLayout({ align: normalizeChoicesAlign(e.target.value) })}>
+	                                <option value="start">靠左</option>
+	                                <option value="center">居中</option>
+	                                <option value="end">靠右</option>
+	                                <option value="stretch">拉伸</option>
+	                              </select>
+	                            </div>
+
+	                            <div className="hr" />
+	                          </>
+	                        )
+	                      })()}
+
+	                      {(Array.isArray(n.choices) ? n.choices : []).map((c) => (
+	                        <div key={c.id} style={{ border: '1px solid rgba(148,163,184,0.16)', borderRadius: 12, padding: 10 }}>
+	                          <div className="form-row">
+	                            <label>按钮文本</label>
+	                            <input
+	                              className="input"
+	                              value={c.text}
+	                              onChange={(e) =>
+	                                setNode((x) => ({
+	                                  ...x,
+	                                  choices: (Array.isArray(x.choices) ? x.choices : []).map((cc) => (cc.id === c.id ? { ...cc, text: e.target.value } : cc))
+	                                }))
+	                              }
+	                            />
+	                          </div>
+	                          <div className="form-row">
+	                            <label>跳转到</label>
+	                            <select
+	                              className="sel"
+	                              value={c.toNodeId}
+	                              onChange={(e) =>
+	                                setNode((x) => ({
+	                                  ...x,
+	                                  choices: (Array.isArray(x.choices) ? x.choices : []).map((cc) =>
+	                                    cc.id === c.id ? { ...cc, toNodeId: e.target.value } : cc
+	                                  )
+	                                }))
+	                              }
+	                            >
+	                              {allNodes.map((nn) => (
+	                                <option key={nn.id} value={nn.id}>
+	                                  {nn.name || nn.id}
+	                                </option>
+	                              ))}
+	                            </select>
+	                          </div>
+	                          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+	                            <button
+	                              className="btn secondary"
+	                              onClick={() =>
+	                                setNode((x) => ({
+	                                  ...x,
+	                                  choices: (Array.isArray(x.choices) ? x.choices : []).filter((cc) => cc.id !== c.id)
+	                                }))
+	                              }
+	                            >
+	                              删除选项
+	                            </button>
+	                          </div>
+	                        </div>
+	                      ))}
+
+	                      <button
+	                        className="btn secondary"
+	                        onClick={() => {
+	                          const toNodeId = doc.story?.startNodeId || nodes[0]?.id || ''
+	                          const next: ChoiceV1 = { id: uid('choice'), text: '继续', toNodeId }
+	                          setNode((x) => ({ ...x, choices: [...(Array.isArray(x.choices) ? x.choices : []), next] }))
+	                        }}
+	                      >
+	                        + 添加选项
+	                      </button>
+	                    </div>
+	                  ) : null}
+	                </div>
+	              ) : null}
+	            </div>
+
+	            */}
+
+	            <div className="fold">
+	              <div className="fold-head" onClick={() => toggleRightFold('timeline')}>
+	                <div className="fold-title">时间线（P0）</div>
+	                <div className="fold-actions" onClick={(e) => e.stopPropagation()}>
+	                  <button
+                    type="button"
+                    className="icon-btn"
+                    title={rightFold.timeline ? '折叠' : '展开'}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      toggleRightFold('timeline')
+                    }}
+                  >
+                    {rightFold.timeline ? '－' : '＋'}
+                  </button>
+                </div>
+              </div>
+
+              {rightFold.timeline ? (
+                <div className="fold-body">
+                  <div className="hint">节点内“PPT式”播放/触发：先执行动作（Actions），再按推进方式（Advance）进入下一步。</div>
+
+            {(() => {
+              const steps = Array.isArray(n.timeline?.steps) ? n.timeline.steps : []
+              const stateVars = Array.isArray(doc.project?.state?.vars) ? doc.project.state.vars : []
+              const eventMacros = Array.isArray(doc.project?.events) ? doc.project.events : []
+
+              const updateSteps = (updater: (steps: any[]) => any[]) =>
+                setNode((x) => {
+                  const nn = ensureNode(x)
+                  const curr = Array.isArray(nn.timeline?.steps) ? nn.timeline.steps : []
+                  return { ...nn, timeline: { steps: updater(curr.slice()) } }
+                })
+
+              const makeDefaultAction = (type: string): any => {
+                if (type === 'ui.setText') return { type: 'ui.setText', mode: 'replace', text: '' }
+                if (type === 'ui.appendText') return { type: 'ui.appendText', text: '' }
+                if (type === 'ui.clearText') return { type: 'ui.clearText' }
+                if (type === 'ui.toast') return { type: 'ui.toast', text: '' }
+                if (type === 'events.emit') return { type: 'events.emit', name: '' }
+                if (type === 'event.call') return { type: 'event.call', eventId: eventMacros[0]?.id || '' }
+                if (type === 'state.set') return { type: 'state.set', var: stateVars[0]?.name || '', value: '' }
+                if (type === 'state.inc') return { type: 'state.inc', var: stateVars[0]?.name || '', value: 1 }
+                if (type === 'state.toggle') return { type: 'state.toggle', var: stateVars[0]?.name || '' }
+                if (type === 'state.tags.add') return { type: 'state.tags.add', var: stateVars[0]?.name || '', value: '' }
+                if (type === 'state.tags.remove') return { type: 'state.tags.remove', var: stateVars[0]?.name || '', value: '' }
+                if (type === 'flow.gotoNode') return { type: 'flow.gotoNode', nodeId: allNodes[0]?.id || '' }
+                if (type === 'stage.setBackground') return { type: 'stage.setBackground', assetId: '' }
+                if (type === 'ui.showEndingCard') return { type: 'ui.showEndingCard', card: defaultEndingCardForNode(n) }
+                return { type }
+              }
+
+              const parseCondValue = (raw: string) => {
+                const s = String(raw ?? '')
+                if (s.trim().toLowerCase() === 'true') return true
+                if (s.trim().toLowerCase() === 'false') return false
+                const n = Number(s)
+                if (Number.isFinite(n) && s.trim() !== '') return n
+                return s
+              }
+
+              const renderActionEditor = (action: any, onChange: (next: any) => void) => {
+                const type = String(action?.type || '')
+                const actionTypes = [
+                  'ui.setText',
+                  'ui.appendText',
+                  'ui.clearText',
+                  'ui.toast',
+                  'events.emit',
+                  'event.call',
+                  'state.set',
+                  'state.inc',
+                  'state.toggle',
+                  'state.tags.add',
+                  'state.tags.remove',
+                  'flow.gotoNode',
+                  'stage.setBackground',
+                  ...(n.kind === 'ending' ? ['ui.showEndingCard'] : [])
+                ]
+
+                return (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div className="form-row">
+                      <label>类型</label>
+                      <select className="sel" value={type} onChange={(e) => onChange(makeDefaultAction(e.target.value))}>
+                        {actionTypes.map((t) => (
+                          <option key={t} value={t}>
+                            {t}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {type === 'ui.setText' ? (
+                      <>
+                        <div className="form-row">
+                          <label>模式</label>
+                          <select className="sel" value={String(action?.mode || 'replace')} onChange={(e) => onChange({ ...action, mode: e.target.value })}>
+                            <option value="replace">替换</option>
+                            <option value="append">追加</option>
+                          </select>
+                        </div>
+                        <div className="form-row">
+                          <label>文本</label>
+                          <textarea className="textarea" value={String(action?.text || '')} onChange={(e) => onChange({ ...action, text: e.target.value })} />
+                        </div>
+                      </>
+                    ) : null}
+
+                    {type === 'ui.appendText' ? (
+                      <div className="form-row">
+                        <label>文本</label>
+                        <textarea className="textarea" value={String(action?.text || '')} onChange={(e) => onChange({ ...action, text: e.target.value })} />
+                      </div>
+                    ) : null}
+
+                    {type === 'ui.toast' ? (
+                      <div className="form-row">
+                        <label>内容</label>
+                        <input className="input" value={String(action?.text || '')} onChange={(e) => onChange({ ...action, text: e.target.value })} />
+                      </div>
+                    ) : null}
+
+                    {type === 'events.emit' ? (
+                      <div className="form-row">
+                        <label>事件名</label>
+                        <input className="input" value={String(action?.name || '')} onChange={(e) => onChange({ ...action, name: e.target.value })} placeholder="例如：ad_ready" />
+                      </div>
+                    ) : null}
+
+                    {type === 'event.call' ? (
+                      <div className="form-row">
+                        <label>事件（宏）</label>
+                        <select className="sel" value={String(action?.eventId || '')} onChange={(e) => onChange({ ...action, eventId: e.target.value })}>
+                          <option value="">（未选择）</option>
+                          {eventMacros.map((ev) => (
+                            <option key={ev.id} value={ev.id}>
+                              {ev.name || ev.id}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ) : null}
+
+                    {type === 'state.set' ? (
+                      <>
+                        <div className="form-row">
+                          <label>变量</label>
+                          <input className="input" value={String(action?.var || '')} onChange={(e) => onChange({ ...action, var: e.target.value })} placeholder="例如：trust" />
+                        </div>
+                        <div className="form-row">
+                          <label>值</label>
+                          <input className="input" value={String(action?.value ?? '')} onChange={(e) => onChange({ ...action, value: e.target.value })} placeholder="字符串/数字/true/false" />
+                        </div>
+                      </>
+                    ) : null}
+
+                    {type === 'state.inc' ? (
+                      <>
+                        <div className="form-row">
+                          <label>变量</label>
+                          <input className="input" value={String(action?.var || '')} onChange={(e) => onChange({ ...action, var: e.target.value })} placeholder="例如：score" />
+                        </div>
+                        <div className="form-row">
+                          <label>增量</label>
+                          <input
+                            className="input"
+                            type="number"
+                            value={String(Number.isFinite(Number(action?.value)) ? Number(action.value) : 1)}
+                            onChange={(e) => onChange({ ...action, value: Number(e.target.value) })}
+                          />
+                        </div>
+                      </>
+                    ) : null}
+
+                    {type === 'state.toggle' ? (
+                      <div className="form-row">
+                        <label>变量</label>
+                        <input className="input" value={String(action?.var || '')} onChange={(e) => onChange({ ...action, var: e.target.value })} placeholder="例如：flag" />
+                      </div>
+                    ) : null}
+
+                    {type === 'state.tags.add' || type === 'state.tags.remove' ? (
+                      <>
+                        <div className="form-row">
+                          <label>变量（tags）</label>
+                          <input className="input" value={String(action?.var || '')} onChange={(e) => onChange({ ...action, var: e.target.value })} placeholder="例如：tags" />
+                        </div>
+                        <div className="form-row">
+                          <label>值</label>
+                          <input className="input" value={String(action?.value || '')} onChange={(e) => onChange({ ...action, value: e.target.value })} placeholder="例如：lied" />
+                        </div>
+                      </>
+                    ) : null}
+
+                    {type === 'flow.gotoNode' ? (
+                      <div className="form-row">
+                        <label>跳转到</label>
+                        <select className="sel" value={String(action?.nodeId || '')} onChange={(e) => onChange({ ...action, nodeId: e.target.value })}>
+                          {allNodes.map((nn) => (
+                            <option key={nn.id} value={nn.id}>
+                              {nn.name || nn.id}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ) : null}
+
+                    {type === 'stage.setBackground' ? (
+                      <div className="form-row">
+                        <label>背景资源</label>
+                        <select className="sel" value={String(action?.assetId || '')} onChange={(e) => onChange({ ...action, assetId: e.target.value })}>
+                          <option value="">（清除）</option>
+                          {(doc.project?.assets || []).map((a) => (
+                            <option key={a.id} value={a.id}>
+                              {a.name || a.id}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ) : null}
+
+                    {type === 'ui.showEndingCard' ? (
+                      <>
+                        <div className="form-row">
+                          <label>标题</label>
+                          <input
+                            className="input"
+                            value={String(action?.card?.title || '')}
+                            onChange={(e) => onChange({ ...action, card: { ...(action?.card || {}), title: e.target.value } })}
+                          />
+                        </div>
+                        <div className="form-row">
+                          <label>结局文案</label>
+                          <textarea
+                            className="textarea"
+                            value={String(action?.card?.moral || '')}
+                            onChange={(e) => onChange({ ...action, card: { ...(action?.card || {}), moral: e.target.value } })}
+                          />
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+                )
+              }
+
+              const renderAdvanceEditor = (advanceIn: any, onChange: (next: any) => void) => {
+                const adv = normalizeAdvance(advanceIn)
+                const type = String((adv as any).type || 'auto')
+                const setType = (t: string) => {
+                  if (t === 'auto') return onChange({ type: 'auto' })
+                  if (t === 'click') return onChange({ type: 'click' })
+                  if (t === 'choice') return onChange({ type: 'choice' })
+                  if (t === 'timer') return onChange({ type: 'timer', ms: 800 })
+                  if (t === 'event') return onChange({ type: 'event', name: '' })
+                  if (t === 'condition') return onChange({ type: 'condition', expr: { op: '==', left: { var: stateVars[0]?.name || 'flag' }, right: true }, pollMs: 200 })
+                  if (t === 'end') return onChange({ type: 'end' })
+                  return onChange({ type: t })
+                }
+
+                const expr = (adv as any).expr
+                const pollMs = Number.isFinite(Number((adv as any).pollMs)) ? Number((adv as any).pollMs) : 200
+                const op = String(expr && (expr as any).op || '==')
+                const varName = String(expr && ((expr as any).var || (expr as any).left?.var) || '')
+                const rhs =
+                  op === 'tags.has'
+                    ? String(expr && (expr as any).value || '')
+                    : String(expr ? ((expr as any).right ?? '') : '')
+
+                return (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    <div className="form-row">
+                      <label>推进方式</label>
+                      <select className="sel" value={type} onChange={(e) => setType(e.target.value)}>
+                        <option value="auto">自动</option>
+                        <option value="click">点击继续</option>
+                        <option value="choice">分支选择</option>
+                        <option value="timer">定时器</option>
+                        <option value="event">等待事件</option>
+                        <option value="condition">等待条件</option>
+                        <option value="end">结束</option>
+                      </select>
+                    </div>
+
+                    {type === 'timer' ? (
+                      <div className="form-row">
+                        <label>毫秒</label>
+                        <input
+                          className="input"
+                          type="number"
+                          value={String(Number.isFinite(Number((adv as any).ms)) ? Number((adv as any).ms) : 0)}
+                          onChange={(e) => onChange({ ...adv, ms: Math.max(0, Math.floor(Number(e.target.value))) })}
+                        />
+                      </div>
+                    ) : null}
+
+                    {type === 'event' ? (
+                      <div className="form-row">
+                        <label>事件名</label>
+                        <input className="input" value={String((adv as any).name || '')} onChange={(e) => onChange({ ...adv, name: e.target.value })} placeholder="例如：ad_ready" />
+                      </div>
+                    ) : null}
+
+                    {type === 'condition' ? (
+                      <>
+                        <div className="form-row">
+                          <label>变量</label>
+                          <input className="input" value={varName} onChange={(e) => {
+                            const v = e.target.value
+                            const nextExpr = op === 'tags.has'
+                              ? { op: 'tags.has', var: v, value: String((expr as any)?.value || '') }
+                              : { op, left: { var: v }, right: parseCondValue(rhs) }
+                            onChange({ ...adv, expr: nextExpr })
+                          }} placeholder="例如：trust" />
+                        </div>
+                        <div className="form-row">
+                          <label>运算</label>
+                          <select className="sel" value={op} onChange={(e) => {
+                            const nextOp = e.target.value
+                            const nextExpr = nextOp === 'tags.has'
+                              ? { op: 'tags.has', var: varName, value: String(rhs || '') }
+                              : { op: nextOp, left: { var: varName }, right: parseCondValue(rhs) }
+                            onChange({ ...adv, expr: nextExpr })
+                          }}>
+                            <option value="==">==</option>
+                            <option value="!=">!=</option>
+                            <option value="<">&lt;</option>
+                            <option value="<=">&lt;=</option>
+                            <option value=">">&gt;</option>
+                            <option value=">=">&gt;=</option>
+                            <option value="tags.has">tags.has</option>
+                          </select>
+                        </div>
+                        <div className="form-row">
+                          <label>值</label>
+                          <input className="input" value={rhs} onChange={(e) => {
+                            const v = e.target.value
+                            const nextExpr = op === 'tags.has'
+                              ? { op: 'tags.has', var: varName, value: v }
+                              : { op, left: { var: varName }, right: parseCondValue(v) }
+                            onChange({ ...adv, expr: nextExpr })
+                          }} placeholder="数字/true/false/字符串" />
+                        </div>
+                        <div className="form-row">
+                          <label>轮询（ms）</label>
+                          <input className="input" type="number" value={String(pollMs)} onChange={(e) => onChange({ ...adv, pollMs: Math.max(50, Math.floor(Number(e.target.value) || 200)) })} />
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+                )
+              }
+
+              return (
+                <div className="form" style={{ gap: 10 }}>
+                  {steps.map((st, idx) => (
+                    <div key={st.id} style={{ border: '1px solid rgba(148,163,184,0.16)', borderRadius: 14, padding: 12 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+                        <div style={{ fontWeight: 800 }}>步骤 {idx + 1}</div>
+                        <div className="script-item-actions">
+                          <button className="icon-btn" title="上移" disabled={idx === 0} onClick={() => updateSteps((arr) => {
+                            const a = arr.slice()
+                            const tmp = a[idx - 1]
+                            a[idx - 1] = a[idx]
+                            a[idx] = tmp
+                            return a
+                          })}>↑</button>
+                          <button className="icon-btn" title="下移" disabled={idx === steps.length - 1} onClick={() => updateSteps((arr) => {
+                            const a = arr.slice()
+                            const tmp = a[idx + 1]
+                            a[idx + 1] = a[idx]
+                            a[idx] = tmp
+                            return a
+                          })}>↓</button>
+                          <button className="icon-btn danger" title="删除步骤" disabled={steps.length <= 1} onClick={() => updateSteps((arr) => arr.filter((_, i) => i !== idx))}>✕</button>
+                        </div>
+                      </div>
+
+                      <div className="hr" />
+
+                      <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>动作</div>
+                      <div className="form" style={{ gap: 8 }}>
+                        {(Array.isArray(st.actions) ? st.actions : []).map((a: any, ai: number) => (
+                          <div key={`${st.id}_a_${ai}`} style={{ border: '1px solid rgba(148,163,184,0.14)', borderRadius: 12, padding: 10 }}>
+                            {renderActionEditor(a, (nextA) =>
+                              updateSteps((arr) => {
+                                const next = arr.slice()
+                                const ss = { ...next[idx] }
+                                const acts = Array.isArray(ss.actions) ? ss.actions.slice() : []
+                                acts[ai] = nextA
+                                ss.actions = acts
+                                next[idx] = ss
+                                return next
+                              })
+                            )}
+                            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
+                              <button
+                                className="btn secondary"
+                                onClick={() =>
+                                  updateSteps((arr) => {
+                                    const next = arr.slice()
+                                    const ss = { ...next[idx] }
+                                    const acts = Array.isArray(ss.actions) ? ss.actions.slice() : []
+                                    ss.actions = acts.filter((_: any, j: number) => j !== ai)
+                                    next[idx] = ss
+                                    return next
+                                  })
+                                }
+                              >
+                                删除动作
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+
+                        <button
+                          className="btn secondary"
+                          onClick={() =>
+                            updateSteps((arr) => {
+                              const next = arr.slice()
+                              const ss = { ...next[idx] }
+                              const acts = Array.isArray(ss.actions) ? ss.actions.slice() : []
+                              acts.push(makeDefaultAction('ui.setText'))
+                              ss.actions = acts
+                              next[idx] = ss
+                              return next
+                            })
+                          }
+                        >
+                          + 添加动作
+                        </button>
+                      </div>
+
+                      <div className="hr" />
+
+                      <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>推进</div>
+                      {renderAdvanceEditor(st.advance, (nextAdv) =>
+                        updateSteps((arr) => {
+                          const next = arr.slice()
+                          next[idx] = { ...next[idx], advance: nextAdv }
+                          return next
+                        })
+                      )}
+                    </div>
+                  ))}
+
+                  <button
+                    className="btn secondary"
+                    onClick={() =>
+                      updateSteps((arr) => [
+                        ...arr,
+                        {
+                          id: uid('st'),
+                          actions: [makeDefaultAction('ui.setText')],
+                          advance: { type: 'click' }
+                        }
+                      ])
+                    }
+                  >
+                    + 添加步骤
+                  </button>
+                </div>
+              )
+            })()}
+	                </div>
+	              ) : null}
+	            </div>
+
+	            <div className="fold">
+	              <div className="fold-head" onClick={() => toggleRightFold('placements')}>
+	                <div className="fold-title">角色摆放</div>
+	                <div className="fold-actions" onClick={(e) => e.stopPropagation()}>
+	                  <button
+                    type="button"
+                    className="icon-btn"
+                    title={rightFold.placements ? '折叠' : '展开'}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      toggleRightFold('placements')
+                    }}
+                  >
+                    {rightFold.placements ? '－' : '＋'}
+                  </button>
+                </div>
+              </div>
+
+              {rightFold.placements ? (
+                <div className="fold-body">
+                  <div className="hint">角色是独立实体；节点只保存摆放 Placement。</div>
+
+            <div className="form" style={{ gap: 8 }}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  className="btn secondary"
+                  onClick={() => {
+                    const choices = doc.project?.characters || []
+                    if (!choices.length) {
+                      window.alert('请先在左侧创建角色')
+                      return
+                    }
+                    const chId = choices[0].id
+                    const p: CharacterPlacementV1 = {
+                      id: uid('pl'),
+                      characterId: chId,
+                      transform: { x: 0.5, y: 1, scale: 1, rotationDeg: 0 },
+                      visible: true,
+                      zIndex: 0
+                    }
+                    setNode((x) => ({
+                      ...x,
+                      visuals: { ...ensureNode(x).visuals, placements: [...(ensureNode(x).visuals?.placements || []), p] }
+                    }))
+                    setActivePlacementId(p.id)
+                  }}
+                >
+                  + 添加角色摆放
+                </button>
+
+                <button className="btn secondary" onClick={() => setActivePlacementId('')}>取消选择摆放</button>
+              </div>
+
+              <div className="list">
+                {placements.map((p) => {
+                  const ch = doc.project?.characters.find((c) => c.id === p.characterId)
+                  return (
+                    <div
+                      key={p.id}
+                      className={`item ${p.id === activePlacementId ? 'active' : ''}`}
+                      onClick={() => setActivePlacementId(p.id)}
+                    >
+                      <div>{ch?.name || p.characterId}</div>
+                      <div className="meta">Placement: {p.id}</div>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {activePlacement ? (
+                <div style={{ border: '1px solid rgba(148,163,184,0.16)', borderRadius: 12, padding: 10 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 8 }}>摆放属性</div>
+
+                  <div className="form-row">
+                    <label>角色</label>
+                    <select
+                      className="sel"
+                      value={activePlacement.characterId}
+                      onChange={(e) => {
+                        const id = e.target.value
+                        setNode((x) => ({
+                          ...x,
+                          visuals: {
+                            ...ensureNode(x).visuals,
+                            placements: (ensureNode(x).visuals?.placements || []).map((pp) =>
+                              pp.id === activePlacement.id ? { ...pp, characterId: id } : pp
+                            )
+                          }
+                        }))
+                      }}
+                    >
+                      {doc.project.characters.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name || c.id}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="form-row">
+                    <label>图片（覆盖）</label>
+                    <select
+                      className="sel"
+                      value={activePlacement.imageAssetId || ''}
+                      onChange={(e) => {
+                        const v = e.target.value || undefined
+                        setNode((x) => ({
+                          ...x,
+                          visuals: {
+                            ...ensureNode(x).visuals,
+                            placements: (ensureNode(x).visuals?.placements || []).map((pp) =>
+                              pp.id === activePlacement.id ? { ...pp, imageAssetId: v } : pp
+                            )
+                          }
+                        }))
+                      }}
+                      title="为当前节点的该角色摆放指定一张“姿势图”（覆盖角色默认图片）"
+                    >
+                      <option value="">（使用角色默认）</option>
+                      {doc.project.assets.map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.name || a.id}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, flexWrap: 'wrap' }}>
+                    <button
+                      className="btn secondary"
+                      onClick={() =>
+                        openPlacementSpriteModal({
+                          nodeId: n.id,
+                          placementId: activePlacement.id,
+                          characterId: activePlacement.characterId
+                        })
+                      }
+                      title="根据当前场景文本生成该角色的“姿势透明 PNG”，并覆盖到该摆放"
+                    >
+                      AI 生成摆放 PNG（透明）
+                    </button>
+                    {activePlacement.imageAssetId ? (
+                      <button
+                        className="btn secondary"
+                        onClick={() => {
+                          setNode((x) => ({
+                            ...x,
+                            visuals: {
+                              ...ensureNode(x).visuals,
+                              placements: (ensureNode(x).visuals?.placements || []).map((pp) =>
+                                pp.id === activePlacement.id ? { ...pp, imageAssetId: undefined } : pp
+                              )
+                            }
+                          }))
+                        }}
+                        title="清除该摆放的图片覆盖，回退为角色默认图片"
+                      >
+                        清除覆盖
+                      </button>
+                    ) : null}
+                  </div>
+
+                  <div className="form-row">
+                    <label>x（0-1）</label>
+                    <input
+                      className="input"
+                      type="number"
+                      step="0.01"
+                      value={activePlacement.transform.x}
+                      onChange={(e) => {
+                        const v = clamp01(Number(e.target.value))
+                        setNode((x) => ({
+                          ...x,
+                          visuals: {
+                            ...ensureNode(x).visuals,
+                            placements: (ensureNode(x).visuals?.placements || []).map((pp) =>
+                              pp.id === activePlacement.id ? { ...pp, transform: { ...pp.transform, x: v } } : pp
+                            )
+                          }
+                        }))
+                      }}
+                    />
+                  </div>
+
+                  <div className="form-row">
+                    <label>y（0-1）</label>
+                    <input
+                      className="input"
+                      type="number"
+                      step="0.01"
+                      value={activePlacement.transform.y}
+                      onChange={(e) => {
+                        const v = clamp01(Number(e.target.value))
+                        setNode((x) => ({
+                          ...x,
+                          visuals: {
+                            ...ensureNode(x).visuals,
+                            placements: (ensureNode(x).visuals?.placements || []).map((pp) =>
+                              pp.id === activePlacement.id ? { ...pp, transform: { ...pp.transform, y: v } } : pp
+                            )
+                          }
+                        }))
+                      }}
+                    />
+                  </div>
+
+                  <div className="form-row">
+                    <label>缩放</label>
+                    <input
+                      className="input"
+                      type="number"
+                      step="0.05"
+                      value={activePlacement.transform.scale}
+                      onChange={(e) => {
+                        const v = Number(e.target.value)
+                        setNode((x) => ({
+                          ...x,
+                          visuals: {
+                            ...ensureNode(x).visuals,
+                            placements: (ensureNode(x).visuals?.placements || []).map((pp) =>
+                              pp.id === activePlacement.id ? { ...pp, transform: { ...pp.transform, scale: v } } : pp
+                            )
+                          }
+                        }))
+                      }}
+                    />
+                  </div>
+
+                  <div className="form-row">
+                    <label>角度</label>
+                    <input
+                      className="input"
+                      type="number"
+                      step="1"
+                      value={activePlacement.transform.rotationDeg}
+                      onChange={(e) => {
+                        const v = Number(e.target.value)
+                        setNode((x) => ({
+                          ...x,
+                          visuals: {
+                            ...ensureNode(x).visuals,
+                            placements: (ensureNode(x).visuals?.placements || []).map((pp) =>
+                              pp.id === activePlacement.id ? { ...pp, transform: { ...pp.transform, rotationDeg: v } } : pp
+                            )
+                          }
+                        }))
+                      }}
+                    />
+                  </div>
+
+                  <div className="form-row">
+                    <label>可见</label>
+                    <select
+                      className="sel"
+                      value={activePlacement.visible === false ? '0' : '1'}
+                      onChange={(e) => {
+                        const v = e.target.value === '0' ? false : true
+                        setNode((x) => ({
+                          ...x,
+                          visuals: {
+                            ...ensureNode(x).visuals,
+                            placements: (ensureNode(x).visuals?.placements || []).map((pp) =>
+                              pp.id === activePlacement.id ? { ...pp, visible: v } : pp
+                            )
+                          }
+                        }))
+                      }}
+                    >
+                      <option value="1">显示</option>
+                      <option value="0">隐藏</option>
+                    </select>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                    <button
+                      className="btn secondary"
+                      onClick={() => {
+                        setNode((x) => ({
+                          ...x,
+                          visuals: {
+                            ...ensureNode(x).visuals,
+                            placements: (ensureNode(x).visuals?.placements || []).filter((pp) => pp.id !== activePlacement.id)
+                          }
+                        }))
+                        setActivePlacementId('')
+                      }}
+                    >
+                      删除摆放
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )
+    }
+
+    if (selection.type === 'character') {
+      const ch = doc.project.characters.find((c) => c.id === selection.id) || null
+      if (!ch) return <div className="section"><div className="hint">角色不存在</div></div>
+
+      return (
+        <div className="section">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+            <div style={{ fontWeight: 700 }}>角色属性</div>
+            <button className="btn secondary" onClick={() => deleteCharacter(ch.id)} disabled={busy}>删除</button>
+          </div>
+
+          <div className="hr" />
+
+          <div className="form">
+            <div className="form-row">
+              <label>名称</label>
+              <input
+                className="input"
+                value={ch.name}
+                onChange={(e) =>
+                  setDocProject((p) => ({
+                    ...p,
+                    characters: p.characters.map((x) => (x.id === ch.id ? { ...x, name: e.target.value } : x))
+                  }))
+                }
+              />
+            </div>
+
+            <div className="form-row">
+              <label>图片资源</label>
+              <select
+                className="sel"
+                value={ch.imageAssetId || ''}
+                onChange={(e) => {
+                  const v = e.target.value || undefined
+                  setDocProject((p) => ({
+                    ...p,
+                    characters: p.characters.map((x) => (x.id === ch.id ? { ...x, imageAssetId: v } : x))
+                  }))
+                }}
+              >
+                <option value="">（无）</option>
+                {doc.project.assets.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name || a.id}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {ch.imageAssetId ? (
+              <div className="hint">
+                预览：
+                <div style={{ marginTop: 8 }}>
+                  {(() => {
+                    const a = doc.project.assets.find((x) => x.id === ch.imageAssetId)
+                    if (!a?.uri) return null
+                    return (
+                      <img
+                        alt={a.name}
+                        src={resolveAsset(a.uri, doc.assetBase)}
+                        style={{ maxWidth: '100%', borderRadius: 10, border: '1px solid rgba(148,163,184,0.18)' }}
+                      />
+                    )
+                  })()}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="hr" />
+
+            <div style={{ fontWeight: 800 }}>AI 角色一致性</div>
+            <div className="hint" style={{ marginTop: 6 }}>
+              建议流程：先提取“角色设定指纹”（用于全局锁定），再生成“透明 PNG 角色图”（可用于摆放/覆盖），避免每个场景人物变脸。
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+              <button className="btn secondary" onClick={() => void runCharacterFingerprint(ch.id)} disabled={busy || chFpBusy}>
+                {chFpBusy ? '提取中…' : 'AI 提取角色设定'}
+              </button>
+              <button className="btn secondary" onClick={() => openCharacterSpriteModal(ch.id)} disabled={busy}>
+                AI 生成角色 PNG（透明）
+              </button>
+            </div>
+
+            {chFpError ? <div style={{ marginTop: 8, color: '#fca5a5', fontSize: 12 }}>{chFpError}</div> : null}
+
+            <div className="form-row" style={{ marginTop: 10 }}>
+              <label>指纹（全局锁定）</label>
+              <textarea
+                className="textarea"
+                rows={3}
+                value={String(ch.ai?.fingerprintPrompt || '')}
+                onChange={(e) =>
+                  setDocProject((p) => ({
+                    ...p,
+                    characters: (p.characters || []).map((x) =>
+                      x.id === ch.id ? { ...x, ai: { ...(x.ai || {}), fingerprintPrompt: e.target.value } } : x
+                    )
+                  }))
+                }
+                placeholder="可手动补充更具体的外貌/服饰/标志性特征（后续全局复用）"
+              />
+            </div>
+
+            <div className="form-row">
+              <label>一致性负面（可选）</label>
+              <input
+                className="input"
+                value={String(ch.ai?.negativePrompt || '')}
+                onChange={(e) =>
+                  setDocProject((p) => ({
+                    ...p,
+                    characters: (p.characters || []).map((x) =>
+                      x.id === ch.id ? { ...x, ai: { ...(x.ai || {}), negativePrompt: e.target.value } } : x
+                    )
+                  }))
+                }
+                placeholder="例如：变脸,换装,发型变化,颜色变化,多只动物"
+              />
+            </div>
+          </div>
+        </div>
+      )
+    }
+
+    if (selection.type === 'asset') {
+      const a = doc.project.assets.find((x) => x.id === selection.id) || null
+      if (!a) return <div className="section"><div className="hint">资源不存在</div></div>
+
+      return (
+        <div className="section">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
+            <div style={{ fontWeight: 700 }}>资源属性</div>
+            <button className="btn secondary" onClick={() => deleteAsset(a.id)} disabled={busy}>删除</button>
+          </div>
+
+          <div className="hr" />
+
+          <div className="form">
+            <div className="form-row">
+              <label>名称</label>
+              <input
+                className="input"
+                value={a.name}
+                onChange={(e) =>
+                  setDocProject((p) => ({
+                    ...p,
+                    assets: p.assets.map((x) => (x.id === a.id ? { ...x, name: e.target.value } : x))
+                  }))
+                }
+              />
+            </div>
+
+            <div className="form-row">
+              <label>URI</label>
+              <input
+                className="input"
+                value={a.uri}
+                onChange={(e) =>
+                  setDocProject((p) => ({
+                    ...p,
+                    assets: p.assets.map((x) => (x.id === a.id ? { ...x, uri: e.target.value } : x))
+                  }))
+                }
+                placeholder="例如：assets/bg.png 或 https://..."
+              />
+            </div>
+
+            <div className="hint">预览</div>
+            {a.uri ? (
+              <img
+                alt={a.name}
+                src={resolveAsset(a.uri, doc.assetBase)}
+                style={{ maxWidth: '100%', borderRadius: 10, border: '1px solid rgba(148,163,184,0.18)' }}
+              />
+            ) : (
+              <div className="hint">未设置 URI</div>
+            )}
+          </div>
+        </div>
+      )
+    }
+
+    return (
+      <div className="section">
+        <div style={{ fontWeight: 800 }}>全局设置（运行时）</div>
+        <div className="hint" style={{ marginTop: 6 }}>
+          这里配置 State（变量/条件）与 Event（宏）。左侧仅做结构导航；所有编辑都在右侧完成。
+        </div>
+
+        <div className="hr" />
+
+        <div style={{ fontWeight: 700 }}>State（变量）</div>
+        <div className="hint">变量名用于条件判断与 state.* 动作（例如：trust / liedCount / tags）。</div>
+
+        <div className="form" style={{ gap: 8, marginTop: 8 }}>
+          {(Array.isArray(doc.project.state?.vars) ? doc.project.state!.vars : []).map((v, i) => (
+            <div key={`${v.name}_${i}`} style={{ border: '1px solid rgba(148,163,184,0.16)', borderRadius: 14, padding: 12 }}>
+              <div className="form-row">
+                <label>名称</label>
+                <input
+                  className="input"
+                  value={String(v.name || '')}
+                  onChange={(e) =>
+                    setDocProject((p) => {
+                      const state = p.state && typeof p.state === 'object' ? p.state : { vars: [] }
+                      const vars = Array.isArray(state.vars) ? state.vars.slice() : []
+                      vars[i] = { ...(vars[i] as any), name: e.target.value }
+                      return { ...p, state: { ...state, vars } }
+                    })
+                  }
+                />
+              </div>
+              <div className="form-row">
+                <label>类型</label>
+                <select
+                  className="sel"
+                  value={String((v as any).type || 'string')}
+                  onChange={(e) =>
+                    setDocProject((p) => {
+                      const state = p.state && typeof p.state === 'object' ? p.state : { vars: [] }
+                      const vars = Array.isArray(state.vars) ? state.vars.slice() : []
+                      const type = e.target.value as any
+                      const cur = vars[i] as any
+                      const def =
+                        type === 'number' ? 0 :
+                        type === 'boolean' ? false :
+                        type === 'tags' ? [] :
+                        ''
+                      vars[i] = { ...cur, type, default: cur && cur.default != null ? cur.default : def }
+                      return { ...p, state: { ...state, vars } }
+                    })
+                  }
+                >
+                  <option value="string">字符串</option>
+                  <option value="number">数字</option>
+                  <option value="boolean">布尔</option>
+                  <option value="tags">标签集合（数组）</option>
+                </select>
+              </div>
+              <div className="form-row">
+                <label>默认值</label>
+                {String((v as any).type || 'string') === 'number' ? (
+                  <input
+                    className="input"
+                    type="number"
+                    value={String(Number.isFinite(Number((v as any).default)) ? Number((v as any).default) : 0)}
+                    onChange={(e) =>
+                      setDocProject((p) => {
+                        const state = p.state && typeof p.state === 'object' ? p.state : { vars: [] }
+                        const vars = Array.isArray(state.vars) ? state.vars.slice() : []
+                        vars[i] = { ...(vars[i] as any), default: Number(e.target.value) }
+                        return { ...p, state: { ...state, vars } }
+                      })
+                    }
+                  />
+                ) : String((v as any).type || 'string') === 'boolean' ? (
+                  <select
+                    className="sel"
+                    value={String(Boolean((v as any).default))}
+                    onChange={(e) =>
+                      setDocProject((p) => {
+                        const state = p.state && typeof p.state === 'object' ? p.state : { vars: [] }
+                        const vars = Array.isArray(state.vars) ? state.vars.slice() : []
+                        vars[i] = { ...(vars[i] as any), default: e.target.value === 'true' }
+                        return { ...p, state: { ...state, vars } }
+                      })
+                    }
+                  >
+                    <option value="true">true</option>
+                    <option value="false">false</option>
+                  </select>
+                ) : String((v as any).type || 'string') === 'tags' ? (
+                  <input
+                    className="input"
+                    value={Array.isArray((v as any).default) ? (v as any).default.join(',') : ''}
+                    onChange={(e) =>
+                      setDocProject((p) => {
+                        const state = p.state && typeof p.state === 'object' ? p.state : { vars: [] }
+                        const vars = Array.isArray(state.vars) ? state.vars.slice() : []
+                        const parts = String(e.target.value || '')
+                          .split(',')
+                          .map((x) => x.trim())
+                          .filter(Boolean)
+                        vars[i] = { ...(vars[i] as any), default: parts }
+                        return { ...p, state: { ...state, vars } }
+                      })
+                    }
+                    placeholder="用逗号分隔，例如：lied,helped"
+                  />
+                ) : (
+                  <input
+                    className="input"
+                    value={String((v as any).default ?? '')}
+                    onChange={(e) =>
+                      setDocProject((p) => {
+                        const state = p.state && typeof p.state === 'object' ? p.state : { vars: [] }
+                        const vars = Array.isArray(state.vars) ? state.vars.slice() : []
+                        vars[i] = { ...(vars[i] as any), default: e.target.value }
+                        return { ...p, state: { ...state, vars } }
+                      })
+                    }
+                  />
+                )}
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <button
+                  className="btn secondary"
+                  onClick={() =>
+                    setDocProject((p) => {
+                      const state = p.state && typeof p.state === 'object' ? p.state : { vars: [] }
+                      const vars = Array.isArray(state.vars) ? state.vars.slice() : []
+                      vars.splice(i, 1)
+                      return { ...p, state: { ...state, vars } }
+                    })
+                  }
+                >
+                  删除变量
+                </button>
+              </div>
+            </div>
+          ))}
+
+          <button
+            className="btn secondary"
+            onClick={() =>
+              setDocProject((p) => {
+                const state = p.state && typeof p.state === 'object' ? p.state : { vars: [] }
+                const vars = Array.isArray(state.vars) ? state.vars.slice() : []
+                vars.push({ name: `var_${vars.length + 1}`, type: 'number', default: 0 })
+                return { ...p, state: { ...state, vars } }
+              })
+            }
+          >
+            + 添加变量
+          </button>
+        </div>
+
+        <div className="hr" />
+
+        <div style={{ fontWeight: 700 }}>Event（宏）</div>
+        <div className="hint">事件宏用于复用动作序列（通过 action: event.call 触发）。</div>
+
+        <div className="form" style={{ gap: 8, marginTop: 8 }}>
+          {(Array.isArray(doc.project.events) ? doc.project.events : []).map((ev, i) => (
+            <div key={ev.id} style={{ border: '1px solid rgba(148,163,184,0.16)', borderRadius: 14, padding: 12 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10 }}>
+                <div style={{ fontWeight: 800 }}>事件：{ev.name || ev.id}</div>
+                <button
+                  className="btn secondary"
+                  onClick={() =>
+                    setDocProject((p) => ({ ...p, events: (Array.isArray(p.events) ? p.events : []).filter((_, j) => j !== i) }))
+                  }
+                >
+                  删除
+                </button>
+              </div>
+
+              <div className="hr" />
+
+              <div className="form-row">
+                <label>名称</label>
+                <input
+                  className="input"
+                  value={String(ev.name || '')}
+                  onChange={(e) =>
+                    setDocProject((p) => {
+                      const list = Array.isArray(p.events) ? p.events.slice() : []
+                      list[i] = { ...(list[i] as any), name: e.target.value }
+                      return { ...p, events: list }
+                    })
+                  }
+                />
+              </div>
+
+              {(() => {
+                const stateVars = Array.isArray(doc.project?.state?.vars) ? (doc.project?.state?.vars || []) : []
+                const actions = Array.isArray((ev as any).actions) ? (ev as any).actions : []
+                const setActions = (updater: (acts: any[]) => any[]) =>
+                  setDocProject((p) => {
+                    const list = Array.isArray(p.events) ? p.events.slice() : []
+                    const cur = list[i] as any
+                    const acts = Array.isArray(cur && cur.actions) ? cur.actions.slice() : []
+                    list[i] = { ...cur, actions: updater(acts) }
+                    return { ...p, events: list }
+                  })
+
+                const makeAction = (type: string): any => {
+                  if (type === 'ui.toast') return { type: 'ui.toast', text: '' }
+                  if (type === 'ui.setText') return { type: 'ui.setText', mode: 'replace', text: '' }
+                  if (type === 'events.emit') return { type: 'events.emit', name: '' }
+                  if (type === 'state.set') return { type: 'state.set', var: stateVars[0]?.name || '', value: '' }
+                  if (type === 'state.inc') return { type: 'state.inc', var: stateVars[0]?.name || '', value: 1 }
+                  if (type === 'state.toggle') return { type: 'state.toggle', var: stateVars[0]?.name || '' }
+                  if (type === 'state.tags.add') return { type: 'state.tags.add', var: stateVars[0]?.name || '', value: '' }
+                  if (type === 'state.tags.remove') return { type: 'state.tags.remove', var: stateVars[0]?.name || '', value: '' }
+                  if (type === 'flow.gotoNode') return { type: 'flow.gotoNode', nodeId: doc.story?.startNodeId || (nodes[0]?.id || '') }
+                  if (type === 'flow.restart') return { type: 'flow.restart' }
+                  if (type === 'flow.backToHub') return { type: 'flow.backToHub' }
+                  return { type }
+                }
+
+                const types = [
+                  'ui.toast',
+                  'ui.setText',
+                  'events.emit',
+                  'state.set',
+                  'state.inc',
+                  'state.toggle',
+                  'state.tags.add',
+                  'state.tags.remove',
+                  'flow.gotoNode',
+                  'flow.restart',
+                  'flow.backToHub'
+                ]
+
+                return (
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.9 }}>动作</div>
+
+                    <div className="form" style={{ gap: 8, marginTop: 8 }}>
+                      {actions.map((a: any, ai: number) => {
+                        const type = String(a && a.type || '')
+                        return (
+                          <div key={`${ev.id}_a_${ai}`} style={{ border: '1px solid rgba(148,163,184,0.14)', borderRadius: 12, padding: 10 }}>
+                            <div className="form-row">
+                              <label>类型</label>
+                              <select className="sel" value={type} onChange={(e) => setActions((acts) => {
+                                const next = acts.slice()
+                                next[ai] = makeAction(e.target.value)
+                                return next
+                              })}>
+                                {types.map((t) => (
+                                  <option key={t} value={t}>{t}</option>
+                                ))}
+                              </select>
+                            </div>
+
+                            {type === 'ui.toast' ? (
+                              <div className="form-row">
+                                <label>内容</label>
+                                <input className="input" value={String(a?.text || '')} onChange={(e) => setActions((acts) => {
+                                  const next = acts.slice()
+                                  next[ai] = { ...next[ai], text: e.target.value }
+                                  return next
+                                })} />
+                              </div>
+                            ) : null}
+
+                            {type === 'ui.setText' ? (
+                              <>
+                                <div className="form-row">
+                                  <label>模式</label>
+                                  <select className="sel" value={String(a?.mode || 'replace')} onChange={(e) => setActions((acts) => {
+                                    const next = acts.slice()
+                                    next[ai] = { ...next[ai], mode: e.target.value }
+                                    return next
+                                  })}>
+                                    <option value="replace">替换</option>
+                                    <option value="append">追加</option>
+                                  </select>
+                                </div>
+                                <div className="form-row">
+                                  <label>文本</label>
+                                  <textarea className="textarea" value={String(a?.text || '')} onChange={(e) => setActions((acts) => {
+                                    const next = acts.slice()
+                                    next[ai] = { ...next[ai], text: e.target.value }
+                                    return next
+                                  })} />
+                                </div>
+                              </>
+                            ) : null}
+
+                            {type === 'events.emit' ? (
+                              <div className="form-row">
+                                <label>事件名</label>
+                                <input className="input" value={String(a?.name || '')} onChange={(e) => setActions((acts) => {
+                                  const next = acts.slice()
+                                  next[ai] = { ...next[ai], name: e.target.value }
+                                  return next
+                                })} placeholder="例如：ad_ready" />
+                              </div>
+                            ) : null}
+
+                            {type === 'state.set' ? (
+                              <>
+                                <div className="form-row">
+                                  <label>变量</label>
+                                  <input className="input" value={String(a?.var || '')} onChange={(e) => setActions((acts) => {
+                                    const next = acts.slice()
+                                    next[ai] = { ...next[ai], var: e.target.value }
+                                    return next
+                                  })} />
+                                </div>
+                                <div className="form-row">
+                                  <label>值</label>
+                                  <input className="input" value={String(a?.value ?? '')} onChange={(e) => setActions((acts) => {
+                                    const next = acts.slice()
+                                    next[ai] = { ...next[ai], value: e.target.value }
+                                    return next
+                                  })} />
+                                </div>
+                              </>
+                            ) : null}
+
+                            {type === 'state.inc' ? (
+                              <>
+                                <div className="form-row">
+                                  <label>变量</label>
+                                  <input className="input" value={String(a?.var || '')} onChange={(e) => setActions((acts) => {
+                                    const next = acts.slice()
+                                    next[ai] = { ...next[ai], var: e.target.value }
+                                    return next
+                                  })} />
+                                </div>
+                                <div className="form-row">
+                                  <label>增量</label>
+                                  <input className="input" type="number" value={String(Number.isFinite(Number(a?.value)) ? Number(a.value) : 1)} onChange={(e) => setActions((acts) => {
+                                    const next = acts.slice()
+                                    next[ai] = { ...next[ai], value: Number(e.target.value) }
+                                    return next
+                                  })} />
+                                </div>
+                              </>
+                            ) : null}
+
+                            {type === 'state.toggle' ? (
+                              <div className="form-row">
+                                <label>变量</label>
+                                <input className="input" value={String(a?.var || '')} onChange={(e) => setActions((acts) => {
+                                  const next = acts.slice()
+                                  next[ai] = { ...next[ai], var: e.target.value }
+                                  return next
+                                })} />
+                              </div>
+                            ) : null}
+
+                            {type === 'state.tags.add' || type === 'state.tags.remove' ? (
+                              <>
+                                <div className="form-row">
+                                  <label>变量</label>
+                                  <input className="input" value={String(a?.var || '')} onChange={(e) => setActions((acts) => {
+                                    const next = acts.slice()
+                                    next[ai] = { ...next[ai], var: e.target.value }
+                                    return next
+                                  })} />
+                                </div>
+                                <div className="form-row">
+                                  <label>值</label>
+                                  <input className="input" value={String(a?.value || '')} onChange={(e) => setActions((acts) => {
+                                    const next = acts.slice()
+                                    next[ai] = { ...next[ai], value: e.target.value }
+                                    return next
+                                  })} />
+                                </div>
+                              </>
+                            ) : null}
+
+                            {type === 'flow.gotoNode' ? (
+                              <div className="form-row">
+                                <label>跳转到</label>
+                                <select className="sel" value={String(a?.nodeId || '')} onChange={(e) => setActions((acts) => {
+                                  const next = acts.slice()
+                                  next[ai] = { ...next[ai], nodeId: e.target.value }
+                                  return next
+                                })}>
+                                  {nodes.map((nn) => (
+                                    <option key={nn.id} value={nn.id}>{nn.name || nn.id}</option>
+                                  ))}
+                                </select>
+                              </div>
+                            ) : null}
+
+                            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
+                              <button className="btn secondary" onClick={() => setActions((acts) => acts.filter((_, j) => j !== ai))}>删除动作</button>
+                            </div>
+                          </div>
+                        )
+                      })}
+
+                      <button className="btn secondary" onClick={() => setActions((acts) => [...acts, makeAction('ui.toast')])}>+ 添加动作</button>
+                    </div>
+                  </div>
+                )
+              })()}
+            </div>
+          ))}
+
+          <button
+            className="btn secondary"
+            onClick={() =>
+              setDocProject((p) => {
+                const list = Array.isArray(p.events) ? p.events.slice() : []
+                list.push({ id: uid('ev'), name: `事件${list.length + 1}`, actions: [] })
+                return { ...p, events: list }
+              })
+            }
+          >
+            + 添加事件宏
+          </button>
+        </div>
+      </div>
+    )
+  })()
+
+  return (
+    <div className="app">
+      <div className="topbar">
+        <div className="left">
+          <div className="title">game_studio · 节点式交互故事编辑器（P0）</div>
+          {showProjectManager ? (
+            <>
+              <button className="btn secondary" onClick={() => refreshProjects()} disabled={busy}>
+                刷新
+              </button>
+              <button className="btn" onClick={() => createNewProject()} disabled={busy}>
+                新建项目
+              </button>
+              <select
+                className="sel"
+                value={doc.mode === 'project' ? doc.id : ''}
+                onChange={(e) => {
+                  const id = e.target.value
+                  if (!id) return
+                  void openProject(id)
+                }}
+              >
+                <option value="">打开项目…</option>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.title || p.id}
+                  </option>
+                ))}
+              </select>
+            </>
+          ) : null}
+        </div>
+
+	        <div className="right">
+	          {props.onBackToHub ? (
+	            <button
+	              className="btn secondary"
+              onClick={async () => {
+                const ok = await saveIfDirty()
+                if (!ok) return
+                props.onBackToHub?.()
+              }}
+              disabled={busy}
+            >
+              返回工作台
+            </button>
+          ) : null}
+
+	          {props.onBack ? (
+	            <button
+	              className="btn secondary"
+              onClick={async () => {
+                const ok = await saveIfDirty()
+                if (!ok) return
+                props.onBack?.()
+              }}
+              disabled={busy}
+            >
+	              返回蓝图
+	            </button>
+	          ) : null}
+
+	          {doc.story ? (
+	            <select
+	              className="sel"
+	              value={runtimeStartNodeId || doc.story.startNodeId}
+	              onChange={(e) => setRuntimeStartNodeId(e.target.value)}
+	              title="播放起点（不影响蓝图结构/导出）"
+	            >
+	              {nodesForList.map((n) => (
+	                <option key={n.id} value={n.id}>
+	                  {nodeLabel(n as any) || '（未命名）'}
+	                </option>
+	              ))}
+	            </select>
+	          ) : null}
+
+	          {doc.mode !== 'none' ? <div className="hint">当前：{doc.title}</div> : null}
+	          {doc.mode !== 'none' ? (
+	            <button className="btn secondary" onClick={() => setSelection({ type: 'none' })} disabled={busy}>
+	              全局设置
+	            </button>
+	          ) : null}
+	          {problems.length ? <div className="hint" style={{ color: '#fca5a5' }}>校验：{problems.length} 个问题</div> : <div className="hint">校验：通过</div>}
+	          <button className="btn secondary" onClick={() => restartRuntime()} disabled={!doc.story}>播放</button>
+	          <button className="btn" onClick={() => saveCurrent()} disabled={busy || doc.mode !== 'project' || !dirty}>保存</button>
+	          <button className="btn secondary" onClick={() => exportCurrent()} disabled={busy || doc.mode !== 'project'}>导出预览</button>
+	        </div>
+	      </div>
+
+      <div className="main">
+        <div className="panel">
+          <div className="tabs">
+            <div className={`tab ${leftTab === 'nodes' ? 'active' : ''}`} onClick={() => setLeftTab('nodes')}>节点</div>
+            <div className={`tab ${leftTab === 'characters' ? 'active' : ''}`} onClick={() => setLeftTab('characters')}>角色</div>
+            <div className={`tab ${leftTab === 'assets' ? 'active' : ''}`} onClick={() => setLeftTab('assets')}>资源</div>
+          </div>
+
+	          <div className="section">
+	            {doc.project && doc.story ? null : null}
+
+	            {leftTab === 'nodes' && doc.story ? (
+	              <>
+	                <div className="list">
+	                  {nodesForList.map((n) => (
+	                    <div
+	                      key={n.id}
+                      className={`item ${selection.type === 'node' && selection.id === n.id ? 'active' : ''}`}
+                      onClick={() => setSelection({ type: 'node', id: n.id })}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                        <div>{nodeLabel(n as any) || n.id}</div>
+                        <div className="meta">{nodeKindLabel((n as any).kind)}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : null}
+
+            {leftTab === 'characters' && doc.project ? (
+              <>
+                <div className="hr" />
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button className="btn secondary" onClick={() => addCharacter()} disabled={doc.readonly}>+ 角色</button>
+                </div>
+                <div className="hr" />
+                <div className="list">
+                  {doc.project.characters.map((c) => (
+                    <div
+                      key={c.id}
+                      className={`item ${selection.type === 'character' && selection.id === c.id ? 'active' : ''}`}
+                      onClick={() => setSelection({ type: 'character', id: c.id })}
+                    >
+                      <div>{c.name || c.id}</div>
+                      <div className="meta">id: {c.id}</div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : null}
+
+            {leftTab === 'assets' && doc.project ? (
+              <>
+                <div className="hr" />
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button className="btn secondary" onClick={() => addAsset()} disabled={doc.readonly}>+ 资源</button>
+                </div>
+                <div className="hr" />
+                <div className="list">
+                  {doc.project.assets.map((a) => (
+                    <div
+                      key={a.id}
+                      className={`item ${selection.type === 'asset' && selection.id === a.id ? 'active' : ''}`}
+                      onClick={() => setSelection({ type: 'asset', id: a.id })}
+                    >
+                      <div>{a.name || a.id}</div>
+                      <div className="meta">id: {a.id}</div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="canvas">
+          <div className="canvas-wrap" ref={canvasHostRef} />
+          {doc.project && doc.story && effectivePreviewNode ? (
+            <div
+              className="stage-ui"
+              ref={stageUiRef}
+              style={
+                stageViewport
+                  ? {
+                      width: stageViewport.stageW,
+                      height: stageViewport.stageH,
+                      transform: `translate(${stageViewport.offsetX}px, ${stageViewport.offsetY}px) scale(${stageViewport.scale})`,
+                      transformOrigin: '0 0'
+                    }
+                  : { width: '100%', height: '100%' }
+              }
+            >
+              <div className="compose-overlay">
+              {(() => {
+                const node = ensureNode(effectivePreviewNode)
+                const showEnding = Boolean(rt.endingCard) || node.kind === 'ending' || rt.wait.kind === 'end'
+
+                const eventList = Array.isArray(doc.project?.events) ? doc.project.events : []
+
+                const onContinue = () => {
+                  if (rt.wait.kind !== 'click') return
+                  clearRuntimeTimers()
+                  setRt((prev) => runTimelineStable({ ...prev, stepIndex: prev.stepIndex + 1, wait: { kind: 'auto' } }, node))
+                }
+
+                const onChoose = (choice: ChoiceV1) => {
+                  if (rt.wait.kind !== 'choice') return
+                  const enabled = choice.enabledWhen ? evalConditionExpr(choice.enabledWhen, rt.vars) : true
+                  if (!enabled) return
+
+                  const base = rtRef.current
+                  let next: RuntimeState = {
+                    ...base,
+                    vars: { ...base.vars },
+                    eventMemory: { ...base.eventMemory },
+                    stageOverride: { ...base.stageOverride },
+                    nav: null
+                  }
+                  const effects = Array.isArray((choice as any).effects) ? ((choice as any).effects as TimelineActionV1[]) : []
+                  for (const a of effects) {
+                    next = applyTimelineAction(next, a as any, eventList, 0)
+                    if (next.nav) break
+                  }
+                  setRt(next)
+                  if (next.nav) return
+                  const to = String(choice.toNodeId || '').trim()
+                  if (!to) return
+                  window.setTimeout(() => setSelection({ type: 'node', id: to }), 200)
+                }
+
+                const card = rt.endingCard || (node.kind === 'ending' ? defaultEndingCardForNode(node) : null)
+
+                const dialogPreset = normalizeDialogPreset((node as any)?.visuals?.ui?.dialog?.preset)
+                const dialogX = clamp01(numberOr((node as any)?.visuals?.ui?.dialog?.x, 0.5))
+                const dialogY = clamp01(numberOr((node as any)?.visuals?.ui?.dialog?.y, 0.88))
+                const choicesDir = normalizeChoicesDirection((node as any)?.visuals?.ui?.choices?.direction)
+                const choicesAlign = normalizeChoicesAlign((node as any)?.visuals?.ui?.choices?.align)
+
+                const dialogWrapStyle: CSSProperties = (() => {
+                  if (dialogPreset === 'custom') {
+                    return { position: 'absolute', inset: 0, padding: 0, pointerEvents: 'none' }
+                  }
+                  const base: CSSProperties = {
+                    position: 'absolute',
+                    inset: 0,
+                    padding: 18,
+                    boxSizing: 'border-box',
+                    display: 'flex',
+                    pointerEvents: 'none'
+                  }
+                  if (dialogPreset === 'top') return { ...base, justifyContent: 'center', alignItems: 'flex-start' }
+                  if (dialogPreset === 'center') return { ...base, justifyContent: 'center', alignItems: 'center' }
+                  if (dialogPreset === 'left') return { ...base, justifyContent: 'flex-start', alignItems: 'center' }
+                  if (dialogPreset === 'right') return { ...base, justifyContent: 'flex-end', alignItems: 'center' }
+                  return { ...base, justifyContent: 'center', alignItems: 'flex-end' }
+                })()
+
+                const dialogCardStyle: CSSProperties =
+                  dialogPreset === 'custom' && stageViewport
+                    ? {
+                        position: 'absolute',
+                        left: stageViewport.stageW * dialogX,
+                        top: stageViewport.stageH * dialogY,
+                        transform: 'translate(-50%, -50%)'
+                      }
+                    : {}
+
+                const choicesStyle: CSSProperties = (() => {
+                  if (choicesDir !== 'column') {
+                    return { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end' }
+                  }
+                  const ai =
+                    choicesAlign === 'start'
+                      ? 'flex-start'
+                      : choicesAlign === 'center'
+                        ? 'center'
+                        : choicesAlign === 'stretch'
+                          ? 'stretch'
+                          : 'flex-end'
+                  return { flexDirection: 'column', flexWrap: 'nowrap', alignItems: ai, justifyContent: 'flex-end' }
+                })()
+
+                const displayText = (() => {
+                  const t = String(rt.text || '')
+                  if (t.trim()) return t
+                  const fallback = String((node as any)?.body?.text || '')
+                  return fallback
+                })()
+                const hasText = String(displayText || '').trim().length > 0
+
+                const setDialogUi = (next: { preset?: DialogPresetV1; x?: number; y?: number }) => {
+                  if (doc.readonly) return
+                  setDocStory((s) => ({
+                    ...s,
+                    nodes: (s.nodes || []).map((n) => {
+                      if (n.id !== node.id) return n
+                      const nn = ensureNode(n)
+                      const visuals = nn.visuals || {}
+                      const ui = (visuals as any).ui && typeof (visuals as any).ui === 'object' ? (visuals as any).ui : {}
+                      const dialog = ui.dialog && typeof ui.dialog === 'object' ? ui.dialog : { preset: 'bottom', x: 0.5, y: 0.88 }
+                      const merged = { ...dialog, ...next }
+                      return { ...nn, visuals: { ...visuals, ui: { ...ui, dialog: merged } } }
+                    })
+                  }))
+                }
+
+                const startDragDialog = (e: React.PointerEvent) => {
+                  if (!stageViewport) return
+                  if (node.kind !== 'scene') return
+                  if (dialogPreset !== 'custom') return
+                  const uiRect = stageUiRef.current?.getBoundingClientRect()
+                  if (!uiRect || !uiRect.width || !uiRect.height) return
+
+                  const cardEl = (e.currentTarget as HTMLElement)?.closest('.dialog-card') as HTMLElement | null
+                  if (!cardEl) return
+                  const cardRect = cardEl.getBoundingClientRect()
+                  if (!cardRect.width || !cardRect.height) return
+
+                  const scale = stageViewport.scale || 1
+                  const pointerStageX = (e.clientX - uiRect.left) / scale
+                  const pointerStageY = (e.clientY - uiRect.top) / scale
+                  const cardCenterStageX = (cardRect.left + cardRect.width / 2 - uiRect.left) / scale
+                  const cardCenterStageY = (cardRect.top + cardRect.height / 2 - uiRect.top) / scale
+
+                  const deltaX = pointerStageX - cardCenterStageX
+                  const deltaY = pointerStageY - cardCenterStageY
+
+                  dragDialogRef.current = {
+                    dragging: true,
+                    pointerId: e.pointerId,
+                    stageW: stageViewport.stageW,
+                    stageH: stageViewport.stageH,
+                    deltaX,
+                    deltaY
+                  }
+
+                  try {
+                    ;(e.currentTarget as any).setPointerCapture?.(e.pointerId)
+                  } catch {}
+
+                  e.preventDefault()
+                  e.stopPropagation()
+                }
+
+                const onDragDialogMove = (e: React.PointerEvent) => {
+                  const st = dragDialogRef.current
+                  if (!st || !st.dragging || st.pointerId !== e.pointerId) return
+                  const uiRect = stageUiRef.current?.getBoundingClientRect()
+                  if (!uiRect) return
+                  const scale = stageViewport?.scale || 1
+                  const pointerStageX = (e.clientX - uiRect.left) / scale
+                  const pointerStageY = (e.clientY - uiRect.top) / scale
+                  const cx = pointerStageX - st.deltaX
+                  const cy = pointerStageY - st.deltaY
+                  const x = clamp01(cx / st.stageW)
+                  const y = clamp01(cy / st.stageH)
+                  setDialogUi({ preset: 'custom', x, y })
+                  e.preventDefault()
+                }
+
+                const endDragDialog = (e: React.PointerEvent) => {
+                  const st = dragDialogRef.current
+                  if (!st || st.pointerId !== e.pointerId) return
+                  dragDialogRef.current = null
+                  try {
+                    ;(e.currentTarget as any).releasePointerCapture?.(e.pointerId)
+                  } catch {}
+                  e.preventDefault()
+                }
+
+                return showEnding ? (
+                  <div className="ending-wrap" style={{ position: 'absolute', inset: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>
+                    <div className="ending-card" style={{ pointerEvents: 'auto' }}>
+                    <div className="ending-title">{card?.title || '结局'}</div>
+                    {card?.bullets?.length ? (
+                      <ul className="ending-bullets">
+                        {card.bullets.map((b, i) => (
+                          <li key={String(i)}>{b}</li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    <div className="ending-moral">{card?.moral || '故事结束。'}</div>
+                    <div className="ending-actions">
+                      {(card?.buttons || []).map((b, i) => {
+                        const bt = String((b as any).type || '')
+                        const label = String((b as any).label || '')
+                        const key = `${bt}_${i}`
+                        if (bt === 'restart') {
+                          return (
+                            <button key={key} className="btn" onClick={() => restartRuntime()}>
+                              {label || '重新开始'}
+                            </button>
+                          )
+                        }
+                        if (bt === 'backToHub') {
+                          return (
+                            <button
+                              key={key}
+                              className="btn secondary"
+                              onClick={() => {
+                                try {
+                                  if (props.onBackToHub) {
+                                    props.onBackToHub()
+                                  } else {
+                                    window.location.reload()
+                                  }
+                                } catch {
+                                  window.location.reload()
+                                }
+                              }}
+                            >
+                              {label || '返回工作台'}
+                            </button>
+                          )
+                        }
+                        return (
+                          <button key={key} className="btn secondary" onClick={() => setToast(label || '未实现按钮')}>
+                            {label || '按钮'}
+                          </button>
+                        )
+                      })}
+                    </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={dialogWrapStyle}>
+                    <div className="dialog-card" style={dialogCardStyle}>
+                    <div
+                      className={`dialog-meta ${dialogPreset === 'custom' ? 'drag-handle' : ''}`}
+                      title={dialogPreset === 'custom' ? '拖动定位对话框' : undefined}
+                      onPointerDown={dialogPreset === 'custom' ? startDragDialog : undefined}
+                      onPointerMove={dialogPreset === 'custom' ? onDragDialogMove : undefined}
+                      onPointerUp={dialogPreset === 'custom' ? endDragDialog : undefined}
+                      onPointerCancel={dialogPreset === 'custom' ? endDragDialog : undefined}
+                    >
+                      {String((node as any).body?.title || '').trim() ? (
+                        <span className="dialog-node">{String((node as any).body?.title || '').trim()}</span>
+                      ) : null}
+                      {rt.wait.kind === 'timer' ? <span className="dialog-wait">自动推进…</span> : null}
+                      {rt.wait.kind === 'event' ? <span className="dialog-wait">等待事件：{rt.wait.name || '（未命名）'}</span> : null}
+                      {rt.wait.kind === 'condition' ? <span className="dialog-wait">等待条件成立…</span> : null}
+                    </div>
+
+                    {hasText ? <div className="dialog-text">{displayText}</div> : null}
+
+                    {rt.wait.kind === 'choice' ? (
+                      <div className={`dialog-choices ${choicesDir === 'column' ? 'vertical' : ''}`} style={choicesStyle}>
+                        {(Array.isArray(node.choices) ? node.choices : [])
+                          .filter((c) => (c.visibleWhen ? evalConditionExpr(c.visibleWhen, rt.vars) : true))
+                          .map((c) => {
+                            const enabled = c.enabledWhen ? evalConditionExpr(c.enabledWhen, rt.vars) : true
+                            return (
+                              <button
+                                key={c.id}
+                                className={`choice-btn ${enabled ? '' : 'disabled'}`}
+                                onClick={() => onChoose(c)}
+                                disabled={!enabled}
+                                style={choicesDir === 'column' && choicesAlign === 'stretch' ? { width: '100%' } : undefined}
+                              >
+                                {c.text || '选择'}
+                              </button>
+                            )
+                          })}
+                      </div>
+                    ) : null}
+
+                    {rt.wait.kind === 'click' ? (
+                      <div className="dialog-actions">
+                        <button className="btn" onClick={onContinue}>
+                          继续
+                        </button>
+                      </div>
+                    ) : null}
+                    </div>
+                  </div>
+                )
+              })()}
+
+              {rt.toast ? <div className="runtime-toast">{rt.toast}</div> : null}
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <div className="panel right">{right}</div>
+      </div>
+
+      {toast ? (
+        <div
+          style={{
+            position: 'fixed',
+            bottom: 16,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: 'rgba(2,6,23,0.92)',
+            border: '1px solid rgba(148,163,184,0.22)',
+            color: '#e5e7eb',
+            padding: '8px 12px',
+            borderRadius: 12,
+            zIndex: 30
+          }}
+        >
+          {toast}
+        </div>
+      ) : null}
+
+	      <AiBackgroundModal
+	        open={aiOpen}
+	        value={aiReq}
+	        busy={aiBusy}
+	        analyzing={aiAnalyzing}
+	        error={aiError}
+          onAutoRecognize={async () => {
+            if (doc.mode !== 'project' || !doc.story) return
+            if (selection.type !== 'node') {
+              setAiError('请先在左侧选择一个节点')
+              return
+            }
+            const node0 = (doc.story.nodes || []).find((n) => n.id === selection.id) || null
+            const node = node0 ? ensureNode(node0) : null
+            if (!node) {
+              setAiError('未找到当前节点')
+              return
+            }
+
+            const title = String((node as any).body?.title || '').trim()
+            const textRaw = String((node as any).body?.text || '').trim()
+            const lines = textRaw
+              .split(/\r?\n/)
+              .map((x) => x.trim())
+              .filter(Boolean)
+            const picked: string[] = []
+            for (const ln of lines) {
+              if (/^选项(?:\d{1,2}|[A-Z])\s*[:：]/i.test(ln)) break
+              picked.push(ln)
+              if (picked.length >= 8) break
+            }
+            const main = picked.join('，').replace(/\s+/g, ' ').trim()
+	            const projectTitle = doc.project ? String((doc.project as any).title || '').trim() : ''
+	            const userInput = [title, main].filter(Boolean).join('：').slice(0, 600)
+	            const userInputForAi0 =
+	              projectTitle && !/故事名[:：]\s*《/.test(userInput)
+	                ? `故事名：《${projectTitle}》\n${userInput}`
+	                : userInput
+              const userInputForAi = aiReq.backgroundOnly
+                ? `${userInputForAi0}\n要求：仅生成背景空镜，不包含人物/动物/角色。`
+                : userInputForAi0
+	            if (!userInput) {
+	              setAiError('当前场景没有可识别文本（body.text 为空）')
+	              return
+	            }
+
+            setAiAnalyzing(true)
+            setAiError('')
+            try {
+              const sceneLocks = aiReq.backgroundOnly ? '' : buildSceneCharacterLocks(node as any)
+              const globalPromptForAi = [String(aiReq.globalPrompt || '').trim(), sceneLocks].filter(Boolean).join('，')
+	              // Reset per-scene fields; keep global locks.
+	              setAiReq((prev) => ({ ...prev, userInput, prompt: '', negativePrompt: '' }))
+	              const res = await analyzeBackgroundPromptAi(doc.id, {
+	                userInput: userInputForAi,
+	                globalPrompt: globalPromptForAi,
+	                globalNegativePrompt: aiReq.globalNegativePrompt,
+	                aspectRatio: aiReq.aspectRatio,
+	                style: aiReq.style
+	              })
+              const nextGlobalPrompt = String(res.result?.globalPrompt || '').trim()
+              const nextGlobalNegativePrompt = String(res.result?.globalNegativePrompt || '').trim()
+              const bgOnlyNeg = '无人物,无动物,无角色'
+              const nextSceneNeg0 = String(res.result?.negativePrompt || '').trim()
+              const nextSceneNeg = aiReq.backgroundOnly ? [nextSceneNeg0, bgOnlyNeg].filter(Boolean).join(', ') : nextSceneNeg0
+              setAiReq((prev) => ({
+                ...prev,
+                userInput,
+                globalPrompt: nextGlobalPrompt,
+                globalNegativePrompt: nextGlobalNegativePrompt,
+                prompt: String(res.result?.prompt || '').trim(),
+                negativePrompt: nextSceneNeg,
+                aspectRatio: (res.result?.aspectRatio as any) || prev.aspectRatio,
+                style: (res.result?.style as any) || prev.style
+              }))
+              setDocProject((p) => {
+                const stateIn = (p && (p as any).state && typeof (p as any).state === 'object') ? (p as any).state : {}
+                const aiBgIn = (stateIn as any).aiBackground && typeof (stateIn as any).aiBackground === 'object' ? (stateIn as any).aiBackground : {}
+                const nextState = { ...stateIn, aiBackground: { ...aiBgIn, globalPrompt: nextGlobalPrompt, globalNegativePrompt: nextGlobalNegativePrompt } }
+                return { ...p, state: nextState }
+              })
+              setToast('已从当前场景自动识别并解析提示词')
+            } catch (e) {
+              setAiError(e instanceof Error ? e.message : String(e))
+            } finally {
+              setAiAnalyzing(false)
+            }
+          }}
+	        onChange={(next) => {
+	          setAiReq(next)
+	          if (doc.mode === 'project' && doc.project) {
+	            const gp = String(next.globalPrompt || '')
+	            const gneg = String(next.globalNegativePrompt || '')
+	            setDocProject((p) => {
+	              const stateIn = (p && (p as any).state && typeof (p as any).state === 'object') ? (p as any).state : {}
+	              const aiBgIn = (stateIn as any).aiBackground && typeof (stateIn as any).aiBackground === 'object' ? (stateIn as any).aiBackground : {}
+	              const nextState = { ...stateIn, aiBackground: { ...aiBgIn, globalPrompt: gp, globalNegativePrompt: gneg } }
+	              return { ...p, state: nextState }
+	            })
+	          }
+	        }}
+	        onClose={() => {
+	          setAiOpen(false)
+	          setAiBusy(false)
+	          setAiAnalyzing(false)
+	          setAiError('')
+	        }}
+		        onAnalyze={async () => {
+		          if (doc.mode !== 'project') return
+		          const userInput = String(aiReq.userInput || '').trim()
+		          if (!userInput) {
+		            setAiError('请先输入「描述文本」')
+		            return
+		          }
+		          const projectTitle = doc.project ? String((doc.project as any).title || '').trim() : ''
+		          const userInputForAi0 =
+		            projectTitle && !/故事名[:：]\s*《/.test(userInput)
+		              ? `故事名：《${projectTitle}》\n${userInput}`
+		              : userInput
+              const userInputForAi = aiReq.backgroundOnly
+                ? `${userInputForAi0}\n要求：仅生成背景空镜，不包含人物/动物/角色。`
+                : userInputForAi0
+		          setAiAnalyzing(true)
+		          setAiError('')
+			          try {
+                  const node0 =
+                    !aiReq.backgroundOnly && selection.type === 'node' && doc.story
+                      ? (doc.story.nodes || []).find((n) => n.id === selection.id) || null
+                      : null
+                  const sceneLocks = node0 ? buildSceneCharacterLocks(ensureNode(node0 as any)) : ''
+                  const globalPromptForAi = [String(aiReq.globalPrompt || '').trim(), sceneLocks].filter(Boolean).join('，')
+			            const res = await analyzeBackgroundPromptAi(doc.id, {
+			              userInput: userInputForAi,
+			              globalPrompt: globalPromptForAi,
+			              globalNegativePrompt: aiReq.globalNegativePrompt,
+			              aspectRatio: aiReq.aspectRatio,
+			              style: aiReq.style
+			            })
+		            const nextGlobalPrompt = String(res.result?.globalPrompt || '').trim()
+		            const nextGlobalNegativePrompt = String(res.result?.globalNegativePrompt || '').trim()
+                const bgOnlyNeg = '无人物,无动物,无角色'
+                const nextSceneNeg0 = String(res.result?.negativePrompt || '').trim()
+                const nextSceneNeg = aiReq.backgroundOnly ? [nextSceneNeg0, bgOnlyNeg].filter(Boolean).join(', ') : nextSceneNeg0
+		            setAiReq((prev) => ({
+		              ...prev,
+		              globalPrompt: nextGlobalPrompt,
+		              globalNegativePrompt: nextGlobalNegativePrompt,
+		              prompt: String(res.result?.prompt || '').trim(),
+		              negativePrompt: nextSceneNeg,
+		              aspectRatio: (res.result?.aspectRatio as any) || prev.aspectRatio,
+		              style: (res.result?.style as any) || prev.style
+		            }))
+		            setDocProject((p) => {
+		              const stateIn = (p && (p as any).state && typeof (p as any).state === 'object') ? (p as any).state : {}
+		              const aiBgIn = (stateIn as any).aiBackground && typeof (stateIn as any).aiBackground === 'object' ? (stateIn as any).aiBackground : {}
+		              const nextState = { ...stateIn, aiBackground: { ...aiBgIn, globalPrompt: nextGlobalPrompt, globalNegativePrompt: nextGlobalNegativePrompt } }
+		              return { ...p, state: nextState }
+		            })
+		            setToast('已解析提示词，可继续生成图片')
+		          } catch (e) {
+	            setAiError(e instanceof Error ? e.message : String(e))
+	          } finally {
+	            setAiAnalyzing(false)
+	          }
+	        }}
+		        onSubmit={async () => {
+		          if (doc.mode !== 'project' || !doc.project || !doc.story) return
+		          if (selection.type !== 'node') {
+		            setAiError('请先在左侧选择一个节点')
+		            return
+		          }
+		          setAiBusy(true)
+		          setAiError('')
+		          try {
+		            let gp = String(aiReq.globalPrompt || '').replace(/\s+/g, ' ').trim()
+		            let sp = String(aiReq.prompt || '').replace(/\s+/g, ' ').trim()
+                const payload: AiBackgroundRequest = { ...aiReq }
+                if (!aiReq.backgroundOnly && selection.type === 'node' && doc.story) {
+                  const node0 = (doc.story.nodes || []).find((n) => n.id === selection.id) || null
+                  const sceneLocks = node0 ? buildSceneCharacterLocks(ensureNode(node0 as any)) : ''
+                  gp = [gp, sceneLocks].filter(Boolean).join('，')
+                  payload.globalPrompt = gp
+                }
+                if (aiReq.backgroundOnly) {
+                  const hint = '空镜头，无人物无动物，无角色'
+                  sp = sp ? `${sp}，${hint}` : hint
+                  const negAdd = '无人物,无动物,无角色'
+                  const neg0 = String(aiReq.negativePrompt || '').trim()
+                  payload.negativePrompt = [neg0, negAdd].filter(Boolean).join(', ')
+                }
+                payload.prompt = sp
+		            const usedPrompt = [gp, sp].filter(Boolean).join('，')
+		            const resp = await generateBackgroundAi(doc.id, payload)
+		            const rawProvider = String((resp as any).provider || '').trim()
+		            const bgProvider: AssetV1['source'] extends { provider?: infer P } ? P : any =
+		              rawProvider === 'sdwebui' || rawProvider === 'comfyui' || rawProvider === 'doubao' ? rawProvider : undefined
+		            const nextUri = resp.url ? resolveUrl(resp.url) : resp.assetPath
+		            setAiLast({ url: nextUri, assetPath: resp.assetPath, provider: rawProvider || undefined, remoteUrl: (resp as any).remoteUrl || undefined })
+		            const node = (doc.story.nodes || []).find((n) => n.id === selection.id) || null
+		            const bgId = String((node as any)?.visuals?.backgroundAssetId || '').trim()
+		            const existing = bgId ? (doc.project.assets || []).find((a) => a.id === bgId) || null : null
+
+			            if (bgId && existing) {
+			              setDocProject((p) => ({
+			                ...p,
+			                    assets: (p.assets || []).map((a) =>
+			                      a.id === bgId
+			                    ? { ...a, uri: nextUri, source: { type: 'ai' as const, prompt: usedPrompt || aiReq.prompt, provider: bgProvider } }
+			                    : a
+			                )
+			              }))
+	              setDocStory((s) => ({
+	                ...s,
+                nodes: (s.nodes || []).map((n) =>
+                  n.id === selection.id ? { ...ensureNode(n), visuals: { ...ensureNode(n).visuals, backgroundAssetId: bgId } } : n
+                )
+              }))
+		            } else {
+		              const assetId = uid('asset')
+		                const asset: AssetV1 = {
+		                  id: assetId,
+		                  kind: 'image',
+		                  name: `AI 背景 ${new Date().toLocaleString()}`,
+		                  uri: nextUri,
+		                source: { type: 'ai' as const, prompt: usedPrompt || aiReq.prompt, provider: bgProvider }
+		                }
+	              setDocProject((p) => ({ ...p, assets: [...(p.assets || []), asset] }))
+	              setDocStory((s) => ({
+	                ...s,
+	                nodes: (s.nodes || []).map((n) =>
+	                  n.id === selection.id ? { ...ensureNode(n), visuals: { ...ensureNode(n).visuals, backgroundAssetId: assetId } } : n
+	                )
+	              }))
+	            }
+			            let previewOk = true
+			            try {
+			              const r = await fetch(nextUri, { method: 'HEAD' })
+			              previewOk = Boolean(r && r.ok)
+			            } catch {
+		              previewOk = false
+		            }
+		            setToast(previewOk ? '背景已生成并应用' : '背景已生成，但预览加载失败（检查静态服务/CORS）')
+			          } catch (e) {
+			            setAiError(e instanceof Error ? e.message : String(e))
+			          } finally {
+	            setAiBusy(false)
+	          }
+	        }}
+	        result={aiLast}
+	        onOpenDir={() => {
+	          if (doc.mode !== 'project') return
+	          const url = resolveUrl(`/api/projects/${encodeURIComponent(String(doc.id))}/assets/ai`)
+	          window.open(url, '_blank', 'noopener,noreferrer')
+	        }}
+	        onOpenImage={() => {
+	          const u = String(aiLast && aiLast.url ? aiLast.url : '').trim()
+	          if (!u) return
+	          window.open(u, '_blank', 'noopener,noreferrer')
+	        }}
+	        onOpenRemote={() => {
+	          const u = String(aiLast && aiLast.remoteUrl ? aiLast.remoteUrl : '').trim()
+	          if (!u) return
+	          window.open(u, '_blank', 'noopener,noreferrer')
+	        }}
+	        onDownload={async () => {
+	          const u = String(aiLast && aiLast.url ? aiLast.url : '').trim()
+	          if (!u) return
+	          try {
+	            const r = await fetch(u)
+	            if (!r.ok) throw new Error(`download_failed: ${r.status}`)
+	            const blob = await r.blob()
+	            const url = URL.createObjectURL(blob)
+	            const a = document.createElement('a')
+	            const name = String(aiLast && aiLast.assetPath ? aiLast.assetPath : '').split('/').filter(Boolean).pop() || 'background.png'
+	            a.href = url
+	            a.download = name
+	            a.style.display = 'none'
+	            document.body.appendChild(a)
+	            a.click()
+	            a.remove()
+	            setTimeout(() => URL.revokeObjectURL(url), 10_000)
+	            setToast('已开始下载图片')
+	          } catch (e) {
+	            setToast(e instanceof Error ? e.message : String(e))
+	          }
+	        }}
+	      />
+
+        <AiCharacterSpriteModal
+          open={chOpen}
+          title="AI 生成角色 PNG（透明）"
+          value={chDraft}
+          busy={chBusy}
+          error={chError}
+          green={chGreen}
+          transparentPreviewUrl={chTransparentPreviewUrl}
+          onChange={(next) => setChDraft(next)}
+          onClose={() => {
+            setChOpen(false)
+            setChBusy(false)
+            setChError('')
+            setChGreen(null)
+            setChTransparentPreviewUrl('')
+            chTargetRef.current = null
+          }}
+          onGenerateGreen={() => void generateCharacterGreen()}
+          onApplyTransparent={() => void applyCharacterTransparent()}
+        />
+	    </div>
+	  )
+}

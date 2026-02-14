@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "1.0",
+  "updatedAt": "2026-02-14T01:52:59.533Z",
+  "enabled": {
+    "scripts": true,
+    "prompt": true,
+    "image": true,
+    "tts": false
+  },
+  "scripts": {
+    "provider": "doubao",
+    "model": null
+  },
+  "prompt": {
+    "provider": "doubao",
+    "model": null
+  },
+  "image": {
+    "provider": "doubao",
+    "model": null,
+    "apiUrl": null,
+    "size": null,
+    "sdwebuiBaseUrl": null
+  },
+  "tts": {
+    "provider": "doubao",
+    "model": null,
+    "apiUrl": null
+  },
+  "network": {
+    "proxyUrl": null
+  }
+}
